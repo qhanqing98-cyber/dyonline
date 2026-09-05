@@ -126,6 +126,10 @@ python downloader.py --hd --cookie "SESSDATA=xxx" "BV1xxxx"
 
 ### 方式二：Web 服务
 
+**一键启动（推荐）**：直接双击根目录的 `start.bat`，脚本会自动完成「创建虚拟环境 → 安装依赖 → 启动服务 → 打开浏览器」，无需手动敲命令。
+
+手动启动：
+
 ```bash
 uvicorn app.main:app --reload
 ```
