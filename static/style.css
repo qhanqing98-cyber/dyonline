@@ -1,0 +1,153 @@
+/* static/style.css */
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: #f7f4ec;
+  color: #242018;
+  font-family: "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
+}
+
+.shell {
+  width: min(920px, calc(100% - 32px));
+  margin: 0 auto;
+  padding: 48px 0;
+}
+
+h1 {
+  margin: 0 0 12px;
+  font-size: 2.4rem;
+}
+
+p {
+  color: #665f52;
+}
+
+.panel {
+  display: grid;
+  gap: 12px;
+  margin-top: 28px;
+  padding: 24px;
+  background: #fffdf7;
+  border: 1px solid #ded6c6;
+  border-radius: 8px;
+}
+
+label {
+  font-weight: 700;
+}
+
+textarea {
+  width: 100%;
+  padding: 12px;
+  border: 1px solid #ded6c6;
+  border-radius: 8px;
+  font: inherit;
+  resize: vertical;
+}
+
+button {
+  min-height: 46px;
+  border: 0;
+  border-radius: 8px;
+  background: #278c5a;
+  color: white;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+/* 任务列表 */
+.tasks {
+  display: grid;
+  gap: 16px;
+  margin-top: 28px;
+}
+
+.task {
+  padding: 20px 24px;
+  background: #fffdf7;
+  border: 1px solid #ded6c6;
+  border-radius: 8px;
+}
+
+.task-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.status {
+  font-weight: 700;
+  color: #8a7f63;
+}
+
+.task.done .status { color: #278c5a; }
+.task.running .status { color: #2b6cb0; }
+.task.failed .status { color: #c0392b; }
+
+.id {
+  color: #a89f8c;
+  font-size: 0.85rem;
+}
+
+.bar {
+  height: 10px;
+  background: #ede7d9;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.bar-fill {
+  height: 100%;
+  background: #278c5a;
+  border-radius: 999px;
+  transition: width 0.4s ease;
+}
+
+.meta {
+  margin-top: 6px;
+  color: #8a7f63;
+  font-size: 0.85rem;
+}
+
+.error {
+  margin-top: 8px;
+  color: #c0392b;
+}
+
+.files {
+  margin-top: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.files a {
+  color: #2b6cb0;
+  text-decoration: none;
+  background: #eef4fb;
+  padding: 4px 10px;
+  border-radius: 999px;
+}
+
+.logs {
+  margin-top: 12px;
+  padding: 12px;
+  background: #f4f0e7;
+  border-radius: 8px;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 0.82rem;
+  color: #55503f;
+  max-height: 160px;
+  overflow: auto;
+}
+
+.log {
+  white-space: pre-wrap;
+  word-break: break-all;
+}

@@ -1,0 +1,100 @@
+<!-- templates/index.html -->
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>个人视频下载工具</title>
+    <link rel="stylesheet" href="/static/style.css">
+  </head>
+  <body>
+    <main class="shell">
+      <h1>个人视频下载工具</h1>
+      <p>输入抖音或 B 站链接，后端会创建下载任务。</p>
+
+      <form class="panel" id="task-form">
+        <label for="links">视频链接</label>
+        <textarea id="links" rows="7" placeholder="每行一个链接"></textarea>
+
+        <button type="submit">创建下载任务</button>
+      </form>
+
+      <section id="tasks" class="tasks"></section>
+    </main>
+
+    <script>
+      const form = document.getElementById('task-form');
+      const linksEl = document.getElementById('links');
+      const tasksEl = document.getElementById('tasks');
+      const tasks = new Map(); // taskId -> 任务快照
+
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const links = linksEl.value.split('\n').map(s => s.trim()).filter(Boolean);
+        if (!links.length) return;
+
+        const res = await fetch('/api/tasks', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ links }),
+        });
+        if (!res.ok) {
+          alert('创建任务失败：' + (await res.text()));
+          return;
+        }
+        const task = await res.json();
+        tasks.set(task.id, task);
+        linksEl.value = '';
+        render();
+      });
+
+      async function poll() {
+        for (const id of [...tasks.keys()]) {
+          const t = tasks.get(id);
+          if (t.status === 'done' || t.status === 'failed') continue;
+          const res = await fetch('/api/tasks/' + id);
+          if (res.ok) tasks.set(id, await res.json());
+        }
+        render();
+      }
+
+      setInterval(poll, 1500);
+
+      function render() {
+        tasksEl.innerHTML = [...tasks.values()].map(taskCard).join('');
+      }
+
+      const STATUS_TEXT = { queued: '排队中', running: '下载中', done: '完成', failed: '失败' };
+
+      function taskCard(task) {
+        const status = STATUS_TEXT[task.status] || task.status;
+        const files = (task.files || [])
+          .map(f => `<a href="${escapeHtml(f)}" download>${escapeHtml(decodeURIComponent(f.split('/').pop()))}</a>`)
+          .join(' ');
+        const logs = (task.logs || []).slice(-8)
+          .map(l => `<div class="log">${escapeHtml(l)}</div>`).join('');
+        const error = task.error ? `<div class="error">${escapeHtml(task.error)}</div>` : '';
+        const filesHtml = files ? `<div class="files">${files}</div>` : '';
+        return `
+          <div class="task ${escapeHtml(task.status)}">
+            <div class="task-head">
+              <span class="status">${status}</span>
+              <span class="id">#${escapeHtml(task.id.slice(0, 8))}</span>
+            </div>
+            <div class="bar"><div class="bar-fill" style="width:${task.progress}%"></div></div>
+            <div class="meta">${task.progress}%${task.phase ? ' · ' + escapeHtml(task.phase) : ''}</div>
+            ${error}
+            ${filesHtml}
+            <div class="logs">${logs}</div>
+          </div>
+        `;
+      }
+
+      function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, c => ({
+          '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+        }[c]));
+      }
+    </script>
+  </body>
+</html>
