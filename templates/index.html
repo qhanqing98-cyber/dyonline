@@ -1,100 +1,94 @@
-<!-- templates/index.html -->
 <!doctype html>
 <html lang="zh-CN">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>个人视频下载工具</title>
-    <link rel="stylesheet" href="/static/style.css">
-  </head>
-  <body>
-    <main class="shell">
-      <h1>个人视频下载工具</h1>
-      <p>输入抖音或 B 站链接，后端会创建下载任务。</p>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0d12">
+  <title>DY·ONLINE 视频下载台</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%2325f4ee'/%3E%3Cstop offset='1' stop-color='%23fe2c55'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath d='M10 6l16 10-16 10z' fill='url(%23g)'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
 
-      <form class="panel" id="task-form">
-        <label for="links">视频链接</label>
-        <textarea id="links" rows="7" placeholder="每行一个链接"></textarea>
+  <!-- ============ 顶栏：品牌 + 实时统计 ============ -->
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">▶</span>
+        <span class="brand-name">DY<em>·</em>ONLINE</span>
+        <span class="brand-sub">视频下载台</span>
+      </div>
+      <div class="stats" id="stats" aria-label="任务统计"></div>
+    </div>
+  </header>
 
-        <button type="submit">创建下载任务</button>
-      </form>
+  <main class="shell">
 
-      <section id="tasks" class="tasks"></section>
-    </main>
+    <!-- ============ 链接输入区 ============ -->
+    <section class="panel composer" aria-labelledby="composer-title">
+      <div class="composer-head">
+        <h2 id="composer-title">粘贴视频链接</h2>
+        <div class="detected" id="detected" aria-live="polite"></div>
+      </div>
 
-    <script>
-      const form = document.getElementById('task-form');
-      const linksEl = document.getElementById('links');
-      const tasksEl = document.getElementById('tasks');
-      const tasks = new Map(); // taskId -> 任务快照
+      <textarea id="links" rows="4" spellcheck="false" autocomplete="off"
+        placeholder="每行一个链接，支持：&#10;· 抖音分享链接 / 口令 / 视频 ID&#10;· B 站 BV 号 / av 号 / b23.tv 短链"
+        aria-label="视频链接输入框"></textarea>
 
-      form.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        const links = linksEl.value.split('\n').map(s => s.trim()).filter(Boolean);
-        if (!links.length) return;
+      <div class="composer-foot">
+        <div class="hint">
+          <kbd>Ctrl</kbd>+<kbd>Enter</kbd> 快速提交 · 自动识别抖音 / B 站
+        </div>
+        <div class="composer-actions">
+          <button type="button" class="btn ghost" id="btn-paste" title="从剪贴板粘贴">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/></svg>
+            粘贴
+          </button>
+          <button type="button" class="btn ghost" id="btn-clear">清空</button>
+          <button type="button" class="btn primary" id="btn-submit">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            <span class="btn-label">开始下载</span>
+          </button>
+        </div>
+      </div>
+    </section>
 
-        const res = await fetch('/api/tasks', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ links }),
-        });
-        if (!res.ok) {
-          alert('创建任务失败：' + (await res.text()));
-          return;
-        }
-        const task = await res.json();
-        tasks.set(task.id, task);
-        linksEl.value = '';
-        render();
-      });
+    <!-- ============ 过滤栏 ============ -->
+    <nav class="filters" aria-label="任务过滤">
+      <div class="tabs" role="tablist" id="tabs">
+        <button class="tab active" data-filter="all" role="tab">全部</button>
+        <button class="tab" data-filter="running" role="tab">进行中</button>
+        <button class="tab" data-filter="done" role="tab">已完成</button>
+        <button class="tab" data-filter="failed" role="tab">失败</button>
+      </div>
+      <button class="btn ghost small" id="btn-hide-done" title="从列表中隐藏已完成和失败的任务">隐藏已结束</button>
+    </nav>
 
-      async function poll() {
-        for (const id of [...tasks.keys()]) {
-          const t = tasks.get(id);
-          if (t.status === 'done' || t.status === 'failed') continue;
-          const res = await fetch('/api/tasks/' + id);
-          if (res.ok) tasks.set(id, await res.json());
-        }
-        render();
-      }
+    <!-- ============ 任务列表 ============ -->
+    <section id="tasks" class="tasks" aria-label="下载任务列表"></section>
 
-      setInterval(poll, 1500);
+    <!-- ============ 空状态 ============ -->
+    <div class="empty" id="empty" hidden>
+      <svg viewBox="0 0 120 90" width="150" height="112" aria-hidden="true">
+        <defs>
+          <linearGradient id="eg" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#25f4ee"/><stop offset="1" stop-color="#fe2c55"/>
+          </linearGradient>
+        </defs>
+        <rect x="18" y="14" width="84" height="56" rx="8" fill="none" stroke="rgba(255,255,255,.14)" stroke-width="2"/>
+        <path d="M52 32l18 10-18 10z" fill="url(#eg)"/>
+        <line x1="34" y1="80" x2="86" y2="80" stroke="rgba(255,255,255,.14)" stroke-width="2" stroke-linecap="round"/>
+        <line x1="46" y1="86" x2="74" y2="86" stroke="rgba(255,255,255,.09)" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+      <p class="empty-title">还没有下载任务</p>
+      <p class="empty-sub">把抖音或 B 站链接粘贴到上面，回车交给后台</p>
+    </div>
 
-      function render() {
-        tasksEl.innerHTML = [...tasks.values()].map(taskCard).join('');
-      }
+  </main>
 
-      const STATUS_TEXT = { queued: '排队中', running: '下载中', done: '完成', failed: '失败' };
+  <!-- ============ 全局通知 ============ -->
+  <div class="toasts" id="toasts" aria-live="polite"></div>
 
-      function taskCard(task) {
-        const status = STATUS_TEXT[task.status] || task.status;
-        const files = (task.files || [])
-          .map(f => `<a href="${escapeHtml(f)}" download>${escapeHtml(decodeURIComponent(f.split('/').pop()))}</a>`)
-          .join(' ');
-        const logs = (task.logs || []).slice(-8)
-          .map(l => `<div class="log">${escapeHtml(l)}</div>`).join('');
-        const error = task.error ? `<div class="error">${escapeHtml(task.error)}</div>` : '';
-        const filesHtml = files ? `<div class="files">${files}</div>` : '';
-        return `
-          <div class="task ${escapeHtml(task.status)}">
-            <div class="task-head">
-              <span class="status">${status}</span>
-              <span class="id">#${escapeHtml(task.id.slice(0, 8))}</span>
-            </div>
-            <div class="bar"><div class="bar-fill" style="width:${task.progress}%"></div></div>
-            <div class="meta">${task.progress}%${task.phase ? ' · ' + escapeHtml(task.phase) : ''}</div>
-            ${error}
-            ${filesHtml}
-            <div class="logs">${logs}</div>
-          </div>
-        `;
-      }
-
-      function escapeHtml(s) {
-        return String(s).replace(/[&<>"']/g, c => ({
-          '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-        }[c]));
-      }
-    </script>
-  </body>
+  <script src="/static/app.js"></script>
+</body>
 </html>
