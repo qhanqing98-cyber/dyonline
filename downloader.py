@@ -32,6 +32,7 @@ import requests
 from playwright.sync_api import sync_playwright
 
 import bilibili
+from app import config
 
 # 模拟新版 Edge/Chrome 浏览器 UA
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -101,6 +102,64 @@ def detect_platform(link):
             re.search(r"(^|[/\s])(BV[0-9A-Za-z]{10}|av\d+)", lk):
         return "bilibili"
     return "douyin"
+
+
+# ---------------------------------------------------------------------------
+# 浏览器启动（引擎可切换：本机用系统 Edge，服务器用 Playwright 自带 Chromium）
+# ---------------------------------------------------------------------------
+_CHROMIUM_ARGS = [
+    # 容器里以 root 运行 Chromium 必须关沙箱，否则直接崩（不加就是启动即退出）
+    "--no-sandbox",
+    # 容器 /dev/shm 默认只有 64MB，不加这个打开大页面会随机 OOM
+    "--disable-dev-shm-usage",
+    # 抹掉最显眼的自动化特征，降低被风控识别的概率
+    "--disable-blink-features=AutomationControlled",
+]
+
+
+def _launch_browser(p, engine=None):
+    """按配置启动 Chromium 内核浏览器。
+
+    msedge   —— 复用系统自带 Edge（Windows 本机首选，抖音反爬识别率最低）
+    chromium —— Playwright 自带内核（Linux 服务器唯一选择，需 playwright install chromium）
+    """
+    engine = (engine or config.DOUYIN_ENGINE or "msedge").lower()
+    if engine == "chromium":
+        try:
+            return p.chromium.launch(headless=True, args=_CHROMIUM_ARGS)
+        except Exception as e:
+            # 最常见的失败是没下载浏览器内核，给出可直接照抄的修复命令
+            raise RuntimeError(
+                "chromium 启动失败，请先执行 playwright install chromium"
+                "（或把 DOUYIN_ENGINE 改回 msedge）"
+                f"：{e}"
+            ) from e
+    return p.chromium.launch(channel="msedge", headless=True)
+
+
+def _new_context(browser):
+    """创建带反爬伪装的浏览器上下文，并按需注入 cookie。"""
+    ctx = browser.new_context(
+        user_agent=USER_AGENT,
+        locale="zh-CN",
+        timezone_id="Asia/Shanghai",
+        viewport={"width": 1280, "height": 800},
+    )
+    # 服务器上没有浏览器登录态，--cookies-from-browser 用不了，只能靠环境变量注入
+    if config.DOUYIN_COOKIE:
+        cookies = []
+        for part in config.DOUYIN_COOKIE.split(";"):
+            name, _, value = part.strip().partition("=")
+            if name and value:
+                cookies.append({
+                    "name": name.strip(),
+                    "value": value.strip(),
+                    "domain": ".douyin.com",
+                    "path": "/",
+                })
+        if cookies:
+            ctx.add_cookies(cookies)
+    return ctx
 
 
 # ---------------------------------------------------------------------------
@@ -193,9 +252,11 @@ def download(url, out_path, session, log_cb=None, progress_cb=None):
                     pct = done * 100 // total
                     if progress_cb:
                         progress_cb(pct, "download")
-                    print(f"\r    下载中 {done}/{total} ({pct}%)",
-                          end="", flush=True)
-        if total:
+                    # 服务模式（有 log_cb）下进度由回调回传，不再刷 stdout 造成日志污染
+                    if log_cb is None:
+                        print(f"\r    下载中 {done}/{total} ({pct}%)",
+                              end="", flush=True)
+        if total and log_cb is None:
             print()
     return done
 
@@ -258,7 +319,8 @@ def process_media(media, aweme_id, outdir, session,
 
 
 def download_douyin(session, link, outdir, use_ytdlp=False,
-                    cookies_browser=None, log_cb=None, progress_cb=None):
+                    cookies_browser=None, log_cb=None, progress_cb=None,
+                    engine=None):
     """抖音下载完整流程:自管 playwright 生命周期，失败可自动 yt-dlp 兜底。
 
     GUI 与 CLI 共用此入口，避免各自维护浏览器生命周期。
@@ -269,9 +331,9 @@ def download_douyin(session, link, outdir, use_ytdlp=False,
     _emit(log_cb, f"[*] 视频 ID: {aweme_id}")
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(channel="msedge", headless=True)
+            browser = _launch_browser(p, engine)
             try:
-                ctx = browser.new_context(user_agent=USER_AGENT, locale="zh-CN")
+                ctx = _new_context(browser)
                 page = ctx.new_page()
                 media = fetch_video_info(page, aweme_id)
             finally:
@@ -293,6 +355,8 @@ def main():
     ap.add_argument("--cookies-from-browser", default=None,
                     help="抖音失败时用 yt-dlp 从浏览器读 cookie 兜底，如 edge/chrome")
     ap.add_argument("--yt-dlp", action="store_true", help="抖音强制使用 yt-dlp 下载")
+    ap.add_argument("--engine", default=None,
+                    help="抖音: 浏览器引擎 msedge(需系统Edge) 或 chromium(需 playwright install chromium)")
     # B 站专用参数
     ap.add_argument("--p", dest="p", default=None,
                     help="B站: 选择分P(页码数字或 ALL，默认下载全部)")
@@ -331,7 +395,8 @@ def main():
         try:
             ok += bool(download_douyin(session, link, outdir,
                                        use_ytdlp=args.yt_dlp,
-                                       cookies_browser=args.cookies_from_browser))
+                                       cookies_browser=args.cookies_from_browser,
+                                       engine=args.engine))
         except Exception as e:
             print(f"[x] 失败: {e}")
 
