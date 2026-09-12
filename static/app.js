@@ -79,10 +79,16 @@ function toast(msg, type = "info") {
   }, 3500);
 }
 
-/** 从文件 URL 里取出文件名并解码（%E4%B9%8B → 之） */
-function fileName(url) {
-  try { return decodeURIComponent(url.split("/").pop()); }
-  catch { return url.split("/").pop(); }
+/** 后端报错统一转成一行可读文字：400/429 是字符串，422 是 Pydantic 数组 */
+function fmtApiError(body, status) {
+  const d = body && body.detail;
+  if (typeof d === "string") return d;
+  if (Array.isArray(d) && d.length) {
+    const first = d[0] || {};
+    const where = (first.loc || []).slice(1).join(".");
+    return `${where ? where + "：" : ""}${first.msg || "参数不合法"}`;
+  }
+  return `HTTP ${status}`;
 }
 
 /* ============================================================
@@ -122,8 +128,8 @@ async function submitLinks() {
       body: JSON.stringify({ links }),
     });
     if (!res.ok) {
-      const detail = await res.json().catch(() => ({ detail: res.statusText }));
-      throw new Error(detail.detail || `HTTP ${res.status}`);
+      const body = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(fmtApiError(body, res.status));
     }
     const task = await res.json();   // 后端返回完整任务对象
     tasks.set(task.id, task);
@@ -239,9 +245,10 @@ function taskCard(t) {
   const firstLink = (t.links && t.links[0]) || "";
   const more = t.links && t.links.length > 1 ? ` +${t.links.length - 1}` : "";
 
+  // t.files 现在存的是文件名（不是 URL），下载走受控接口并带上任务 id 做归属校验
   const files = (t.files || []).map((f) => `
-    <a href="${escapeHtml(f)}" download title="点击下载">
-      <span aria-hidden="true">⬇</span><span class="fname">${escapeHtml(fileName(f))}</span>
+    <a href="/api/tasks/${escapeHtml(t.id)}/files/${encodeURIComponent(f)}" download title="点击下载">
+      <span aria-hidden="true">⬇</span><span class="fname">${escapeHtml(f)}</span>
     </a>`).join("");
 
   // 日志按类型着色：[OK] 绿色 / [x] 失败红色

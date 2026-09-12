@@ -1,38 +1,61 @@
 # app/main.py
 import re
+import shutil
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
-from urllib.parse import quote
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 import bilibili
 import downloader
+from app import config
 from app.task_store import TaskStore
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-DOWNLOAD_DIR = BASE_DIR / "downloads"
-DOWNLOAD_DIR.mkdir(exist_ok=True)
+DOWNLOAD_DIR = config.DOWNLOAD_DIR
 
 app = FastAPI(title="Video Downloader Web")
-templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+templates = Jinja2Templates(directory=str(config.BASE_DIR / "templates"))
 store = TaskStore()
 
-app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
-app.mount("/files", StaticFiles(directory=str(DOWNLOAD_DIR)), name="files")
+# 静态资源照常挂载。下载文件不再裸挂目录 —— 旧版 /files 不带任何校验，
+# 任何人访问 /files/ 就能浏览整个 downloads 目录、下载所有任务的文件；
+# 现在改为 /api/tasks/{id}/files/{name} 受控接口（见下方 get_task_file）。
+app.mount("/static", StaticFiles(directory=str(config.BASE_DIR / "static")), name="static")
 
 # 从下载日志里解析“已保存”的文件路径，用于生成前端下载链接
 _SAVED_RE = re.compile(r"\[OK\] 已保存:\s*(.+?)\s*\(\d+ bytes\)")
 
 
 class TaskRequest(BaseModel):
-    links: list[str]
+    # 单任务链接数上限：防止一次灌入海量链接占满队列
+    links: list[str] = Field(max_length=config.MAX_LINKS_PER_TASK)
+
+    @field_validator("links")
+    @classmethod
+    def _check_links(cls, value: list[str]) -> list[str]:
+        if not value:
+            raise ValueError("链接列表不能为空")
+        for link in value:
+            if len(link) > config.MAX_LINK_LEN:
+                raise ValueError(f"单条链接过长（上限 {config.MAX_LINK_LEN} 字符）")
+        return value
+
+
+# ---------------------------------------------------------------------------
+# 并发控制：下载线程池 + 排队计数
+# 旧版每个请求无限制开线程，一个脚本就能把服务器内存打爆。
+# 现在最多 MAX_CONCURRENCY 个任务真正在下载，其余排队，排满直接返回 429。
+# ---------------------------------------------------------------------------
+_pool = ThreadPoolExecutor(max_workers=config.MAX_CONCURRENCY, thread_name_prefix="dl")
+_pending_lock = threading.Lock()
+_pending = 0
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -41,7 +64,7 @@ def home(request: Request):
 
 
 def _run_task(task_id: str) -> None:
-    """在后台线程里执行下载任务，通过回调把进度/日志写回 TaskStore。"""
+    """在线程池里执行下载任务，通过回调把进度/日志写回 TaskStore。"""
     task = store.get(task_id)
     if task is None:
         return
@@ -51,13 +74,23 @@ def _run_task(task_id: str) -> None:
         store.append_log(task_id, msg)
         m = _SAVED_RE.search(msg)
         if m:
+            # 只存文件名；下载走 GET /api/tasks/{id}/files/{name}（带归属校验）
             fname = Path(m.group(1)).name
-            store.add_file(task_id, f"/files/{quote(fname)}")
+            store.add_file(task_id, fname)
 
     def progress(pct: int, phase: str = "") -> None:
+        # 进度回调频次很高，写库节流已在 TaskStore.update 内部做掉，这里直接转发
         store.update(task_id, progress=pct, phase=phase)
 
     session = requests.Session()
+
+    # 磁盘保护：剩余空间不足直接拒绝，防止把服务器写满导致整个服务挂掉
+    free_mb = shutil.disk_usage(DOWNLOAD_DIR).free // (1024 * 1024)
+    if free_mb < config.MIN_FREE_MB:
+        store.update(task_id, status="failed", phase="done",
+                     error=f"磁盘剩余空间不足（{free_mb}MB < {config.MIN_FREE_MB}MB），任务拒绝执行")
+        return
+
     store.update(task_id, status="running", phase="download")
 
     bili_links = [l for l in links if downloader.detect_platform(l) == "bilibili"]
@@ -91,15 +124,26 @@ def _run_task(task_id: str) -> None:
     except Exception as e:
         store.update(task_id, status="failed", phase="done", error=str(e))
         log(f"[x] 任务异常: {e}")
+    finally:
+        global _pending
+        with _pending_lock:
+            _pending -= 1
 
 
 @app.post("/api/tasks")
 def create_task(body: TaskRequest):
+    global _pending
     links = [l.strip() for l in body.links if l and l.strip()]
     if not links:
         raise HTTPException(status_code=400, detail="链接列表不能为空")
+    with _pending_lock:
+        if _pending >= config.QUEUE_LIMIT:
+            raise HTTPException(status_code=429,
+                                detail="服务器繁忙：排队任务已满，请稍后再试")
     task = store.create(links)
-    threading.Thread(target=_run_task, args=(task.id,), daemon=True).start()
+    with _pending_lock:
+        _pending += 1
+    _pool.submit(_run_task, task.id)
     return asdict(task)
 
 
@@ -114,3 +158,35 @@ def get_task(task_id: str):
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     return asdict(task)
+
+
+@app.get("/api/tasks/{task_id}/files/{filename}")
+def get_task_file(task_id: str, filename: str):
+    """受控下载接口：只允许取该任务自己产出的文件。
+
+    安全三连：归属校验（403）→ 只取 basename 防路径穿越 → 存在性检查（404）。
+    """
+    task = store.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    fname = Path(filename).name            # 防 ../../ 类路径穿越
+    if fname not in task.files:
+        raise HTTPException(status_code=403, detail="该文件不属于此任务")
+    path = DOWNLOAD_DIR / fname
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="文件已不存在（可能已被清理）")
+    return FileResponse(path, filename=fname, media_type="application/octet-stream")
+
+
+@app.get("/healthz")
+def healthz():
+    """探活 + 运行状态，部署时给反向代理 / 监控用。"""
+    free_mb = shutil.disk_usage(DOWNLOAD_DIR).free // (1024 * 1024)
+    with _pending_lock:
+        queued = _pending
+    return {
+        "status": "ok",
+        "disk_free_mb": free_mb,
+        "queue_pending": queued,
+        "max_concurrency": config.MAX_CONCURRENCY,
+    }
