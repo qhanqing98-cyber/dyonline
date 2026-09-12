@@ -79,6 +79,16 @@ function toast(msg, type = "info") {
   }, 3500);
 }
 
+/** 统一 fetch：同源请求自动带 Cookie；遇到 401 直接跳登录页 */
+async function apiFetch(url, options = {}) {
+  const res = await fetch(url, { credentials: "same-origin", ...options });
+  if (res.status === 401) {
+    location.replace("/login?next=" + encodeURIComponent(location.pathname));
+    throw new Error("未登录或登录已失效");
+  }
+  return res;
+}
+
 /** 后端报错统一转成一行可读文字：400/429 是字符串，422 是 Pydantic 数组 */
 function fmtApiError(body, status) {
   const d = body && body.detail;
@@ -122,7 +132,7 @@ async function submitLinks() {
 
   try {
     // fetch 发送 JSON 到后端：POST /api/tasks {"links": [...]}
-    const res = await fetch("/api/tasks", {
+    const res = await apiFetch("/api/tasks", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ links }),
@@ -165,7 +175,7 @@ function startPolling() {
     // 并行查询所有活跃任务（Promise.all 一起发）
     await Promise.all(active.map(async (t) => {
       try {
-        const res = await fetch("/api/tasks/" + t.id);
+        const res = await apiFetch("/api/tasks/" + t.id);
         if (res.ok) tasks.set(t.id, await res.json());
       } catch { /* 网络抖动时下一轮重试 */ }
     }));
@@ -176,7 +186,7 @@ function startPolling() {
 /** 页面加载 / 刷新后，从后端拉取全部历史任务（内存仓库还在） */
 async function loadAll() {
   try {
-    const res = await fetch("/api/tasks");
+    const res = await apiFetch("/api/tasks");
     if (res.ok) {
       (await res.json()).forEach((t) => tasks.set(t.id, t));
       render();
@@ -351,6 +361,17 @@ tasksEl.addEventListener("click", (e) => {
   renderTasks._fp = null;
   renderTasks();
 });
+
+/* ---------- 退出登录 ---------- */
+const btnLogout = $("#btn-logout");
+if (btnLogout) {
+  btnLogout.addEventListener("click", async () => {
+    try {
+      await fetch("/api/logout", { method: "POST", credentials: "same-origin" });
+    } catch { /* 网络异常也照样跳走 */ }
+    location.replace("/login");
+  });
+}
 
 /* ---------- 启动 ---------- */
 updateDetected();

@@ -2,20 +2,26 @@
 import re
 import shutil
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field, field_validator
 
 import bilibili
 import downloader
-from app import config
+from app import auth, config
 from app.task_store import TaskStore
 
 DOWNLOAD_DIR = config.DOWNLOAD_DIR
@@ -28,6 +34,9 @@ store = TaskStore()
 # 任何人访问 /files/ 就能浏览整个 downloads 目录、下载所有任务的文件；
 # 现在改为 /api/tasks/{id}/files/{name} 受控接口（见下方 get_task_file）。
 app.mount("/static", StaticFiles(directory=str(config.BASE_DIR / "static")), name="static")
+
+# 访问鉴权中间件（config.ACCESS_TOKEN 为空时内部直接放行，等于关闭）
+app.add_middleware(auth.AuthMiddleware)
 
 # 从下载日志里解析“已保存”的文件路径，用于生成前端下载链接
 _SAVED_RE = re.compile(r"\[OK\] 已保存:\s*(.+?)\s*\(\d+ bytes\)")
@@ -190,3 +199,39 @@ def healthz():
         "queue_pending": queued,
         "max_concurrency": config.MAX_CONCURRENCY,
     }
+
+
+# ---------------------------------------------------------------------------
+# 登录 / 退出
+# ---------------------------------------------------------------------------
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request):
+    # 未启用鉴权时不该出现登录页，直接回首页，避免把使用者绕晕
+    if not auth.enabled():
+        return RedirectResponse("/", status_code=302)
+    return templates.TemplateResponse(request, "login.html")
+
+
+class LoginRequest(BaseModel):
+    # 限长只是防御性约束，避免超长输入
+    token: str = Field(max_length=256)
+
+
+@app.post("/api/login")
+def do_login(body: LoginRequest):
+    if not auth.enabled():
+        raise HTTPException(status_code=400, detail="服务端未启用访问口令")
+    if not auth.check_token(body.token):
+        time.sleep(0.8)          # 失败延迟：抬高暴力破解成本
+        # 统一文案，不区分具体原因，避免泄露内部信息
+        raise HTTPException(status_code=401, detail="口令错误")
+    response = JSONResponse({"ok": True})
+    auth.attach_cookie(response)
+    return response
+
+
+@app.post("/api/logout")
+def do_logout():
+    response = JSONResponse({"ok": True})
+    auth.clear_cookie(response)
+    return response
