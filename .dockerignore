@@ -1,0 +1,39 @@
+# ---- 版本控制 ----
+.git
+.gitignore
+
+# ---- 虚拟环境 ----
+.venv
+venv
+env
+
+# ---- 运行期数据（绝不能进镜像）----
+downloads
+data
+*.db
+*.db-wal
+*.db-shm
+
+# ---- 密钥（只通过 env_file 注入）----
+.env
+.env.*
+
+# ---- Python 缓存 ----
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# ---- 编辑器 / 系统文件 ----
+.idea
+.vscode
+.DS_Store
+Thumbs.db
+
+# ---- 镜像内不需要的文档与部署产物 ----
+*.md
+Dockerfile
+docker-compose.yml
+Caddyfile
+.dockerignore

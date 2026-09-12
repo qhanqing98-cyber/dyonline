@@ -1,0 +1,84 @@
+# docker-compose.yml
+# ============================================================
+# 一键部署编排：应用 + Caddy（自动 HTTPS）+ 数据持久化
+#
+# 用法：
+#   cp .env.example .env       # 填好 ACCESS_TOKEN / DOMAIN / MAX_CONCURRENCY
+#   docker compose up -d --build
+#   docker compose logs -f app
+#
+# 无域名（直接用 IP 访问）的做法见文件末尾注释。
+# ============================================================
+services:
+
+  app:
+    build: .
+    image: dyonline-app:latest
+    container_name: dyonline-app
+    restart: unless-stopped            # 崩溃自动重启；重启机器也会自启
+
+    env_file: .env                     # 配置与密钥从这里注入，不进镜像
+    environment:
+      HOST: 0.0.0.0                    # 容器内必须监听 0.0.0.0（覆盖 .env 里的 127.0.0.1）
+      PORT: "8000"
+      TZ: Asia/Shanghai                # 不设置的话日志时间会比本地少 8 小时
+
+    # 只绑宿主机回环：公网必须经 Caddy 进来，应用本身不直接暴露
+    # 无域名时改成 "8000:8000"（见文末注释）
+    ports:
+      - "127.0.0.1:8000:8000"
+
+    volumes:
+      - ./data:/app/data               # SQLite 库：任务、进度、日志
+      - ./downloads:/app/downloads     # 下载好的视频文件
+
+    # Chromium 必需：Docker 默认 /dev/shm 只有 64MB，不加这个会「偶发崩溃」
+    shm_size: "1gb"
+
+    # 防止单个任务吃满整机内存拖垮宿主机
+    # 建议设为机器内存的 60%~70%；2G 小机器可以降到 1200m
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+    # 日志轮转，避免日志把磁盘写满
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: dyonline-caddy
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy     # 等 app 探活通过再启动，避免启动即 502
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}     # 在 .env 里设置你的域名
+      ACME_EMAIL: ${ACME_EMAIL:-}      # Let's Encrypt 通知邮箱（可选）
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data               # 证书持久化：重启不会重复申请（否则会触发限流）
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+# ============================================================
+# 无域名：直接用 IP 访问
+#   1) 注释掉整个 caddy 服务（以及文件末尾的 volumes 声明）
+#   2) 把 app 的 ports 改成：
+#        ports:
+#          - "8000:8000"
+#   3) 安全组放行 8000
+#
+#   ⚠️ 此时是明文 HTTP，ACCESS_TOKEN 会以明文经过网络 ——
+#      仅建议临时测试，正式使用请务必配域名 + HTTPS。
+# ============================================================

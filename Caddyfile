@@ -1,0 +1,26 @@
+# Caddyfile
+# ============================================================
+# Caddy 反向代理 + 自动 HTTPS
+#   配了域名  → 自动向 Let's Encrypt 申请证书并自动续期（无需 certbot）
+#   用 localhost → 自动用内部 CA 签发本地证书
+#
+# 站点地址来自 .env 的 DOMAIN（由 compose 注入环境变量）
+# ============================================================
+
+{$DOMAIN:localhost} {
+	encode gzip
+
+	# 请求体只用于提交链接的 JSON，限制大小防滥用
+	request_body {
+		max_size 256KB
+	}
+
+	# 反向代理到应用容器（app 是 compose 网络内的服务名）
+	reverse_proxy app:8000 {
+		transport http {
+			# 视频下载是长连接大文件传输，放宽读写超时
+			read_timeout 1h
+			write_timeout 1h
+		}
+	}
+}
