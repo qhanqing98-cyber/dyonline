@@ -9,7 +9,7 @@ app/main.py 无需感知存储从 dict 换成了 SQLite。
 并发下载由 ThreadPoolExecutor 控制，多 worker 会让任务队列分叉、状态互不可见。
 """
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from json import dumps, loads
 from pathlib import Path
 from sqlite3 import connect, Row
@@ -17,6 +17,20 @@ from threading import Lock
 from uuid import uuid4
 
 from app import config
+
+
+def _now() -> str:
+    """统一时间戳：UTC + 显式时区偏移。
+
+    - 带 +00:00 后缀，前端 new Date() 解析零歧义，自动换算成浏览器本地时间；
+      之前的 datetime.now().isoformat() 不带时区，隐含依赖「容器时区 == 浏览器时区」，
+      容器一旦退回 UTC 就会出现 8 小时的时间偏差
+    - timespec="milliseconds"：ES 规范只保证支持 3 位小数，
+      datetime 默认的 6 位微秒在部分浏览器会解析失败（返回 Invalid Date）
+    - 存 UTC 是行业标准：换服务器时区、换机器都不影响历史数据；
+      同格式 ISO 字符串排序 == 时间排序，ORDER BY created_at DESC 不受影响
+    """
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 @dataclass
@@ -45,8 +59,8 @@ class DownloadTask:
     # 失败原因
     error: str | None = None
 
-    # 创建时间，方便以后排查任务
-    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    # 创建时间（UTC + 时区偏移，见 _now()），方便以后排查任务
+    created_at: str = field(default_factory=_now)
 
 
 class TaskStore:
@@ -134,7 +148,7 @@ class TaskStore:
             "UPDATE tasks SET status='failed', phase='done',"
             " error='服务重启导致任务中断', updated_at=?"
             " WHERE status IN ('running','queued')",
-            (datetime.now().isoformat(),),
+            (_now(),),
         )
         self.conn.commit()
         if cur.rowcount:
@@ -146,7 +160,7 @@ class TaskStore:
     def create(self, links: list[str]) -> DownloadTask:
         # uuid4 用来生成随机任务 id
         task = DownloadTask(id=uuid4().hex, links=list(links))
-        now = datetime.now().isoformat()
+        now = _now()
 
         with self.lock:
             self.conn.execute(
@@ -197,7 +211,7 @@ class TaskStore:
             sets.append(f"{key} = ?")
             params.append(value)
         sets.append("updated_at = ?")
-        params.append(datetime.now().isoformat())
+        params.append(_now())
         params.append(task_id)
 
         with self.lock:
@@ -245,7 +259,7 @@ class TaskStore:
             files.append(url)
             self.conn.execute(
                 "UPDATE tasks SET files=?, updated_at=? WHERE id=?",
-                (dumps(files, ensure_ascii=False), datetime.now().isoformat(), task_id),
+                (dumps(files, ensure_ascii=False), _now(), task_id),
             )
             self.conn.commit()
 
