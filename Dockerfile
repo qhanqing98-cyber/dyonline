@@ -15,11 +15,15 @@ FROM mcr.microsoft.com/playwright/python:v1.60.0-jammy
 # ---------- 系统依赖 ----------
 # ffmpeg         : B 站 1080P 的 DASH 音视频合并（bilibili.py 会直接调用它）
 # fonts-noto-cjk : 中文字体；抖音的 DOM 兜底取标题路径需要它，否则渲染成方块
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+# tzdata: 时区数据库！缺了它 TZ=Asia/Shanghai 不生效，容器时间会退回 UTC（比国内少 8 小时）
+RUN sed -i 's@//.*archive.ubuntu.com@//mirrors.aliyun.com@g; s@//security.ubuntu.com@//mirrors.aliyun.com@g' /etc/apt/sources.list \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ffmpeg \
         fonts-noto-cjk \
+        tzdata \
     && rm -rf /var/lib/apt/lists/*
+
 
 WORKDIR /app
 
@@ -28,8 +32,8 @@ WORKDIR /app
 COPY requirements.txt .
 # 第二次 pip install 是刻意为之：requirements 里写的是 playwright>=1.49.0，
 # 可能装到比镜像更新的版本，这里强制拉回与镜像浏览器匹配的版本
-RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir "playwright==1.60.0"
+RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt \
+    && pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple "playwright==1.60.0"
 
 # ---------- 应用代码 ----------
 COPY . .
