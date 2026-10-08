@@ -90,7 +90,11 @@ class ProtectFileTransfers:
         self.cleanup = cleanup
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope["path"].startswith("/files/"):
+        path = scope.get("path", "")
+        is_file = path.startswith("/files/") or (
+            path.startswith("/api/tasks/") and "/files/" in path
+        )
+        if scope["type"] == "http" and is_file:
             with self.cleanup.protect():
                 await self.app(scope, receive, send)
         else:

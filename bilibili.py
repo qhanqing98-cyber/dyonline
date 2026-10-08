@@ -136,9 +136,11 @@ def _download_stream(session, url, out_path, log_cb=None, progress_cb=None,
                     pct = done * 100 // total
                     if progress_cb:
                         progress_cb(pct, phase)
-                    print(f"\r    下载中 {done}/{total} ({pct}%)",
-                          end="", flush=True)
-        if total:
+                    # 服务模式（有 log_cb）下进度走回调，不刷 stdout
+                    if log_cb is None:
+                        print(f"\r    下载中 {done}/{total} ({pct}%)",
+                              end="", flush=True)
+        if total and log_cb is None:
             print()
     return done
 

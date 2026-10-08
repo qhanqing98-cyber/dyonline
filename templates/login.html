@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0d12">
+  <title>登录 · DY·ONLINE</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%2325f4ee'/%3E%3Cstop offset='1' stop-color='%23fe2c55'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath d='M10 6l16 10-16 10z' fill='url(%23g)'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login-body">
+
+  <main class="login-card">
+    <div class="brand login-brand">
+      <span class="brand-mark" aria-hidden="true">▶</span>
+      <span class="brand-name">DY<em>·</em>ONLINE</span>
+    </div>
+    <p class="login-sub">请输入访问口令</p>
+
+    <form class="login-form" id="login-form" autocomplete="off">
+      <input id="token" type="password" placeholder="访问口令" aria-label="访问口令"
+             autocomplete="current-password" required>
+      <button type="submit" class="btn primary" id="btn-login">
+        <span class="btn-label">进入下载台</span>
+      </button>
+    </form>
+
+    <p class="login-msg" id="login-msg" hidden></p>
+  </main>
+
+  <script>
+    (function () {
+      const form = document.getElementById("login-form");
+      const input = document.getElementById("token");
+      const btn = document.getElementById("btn-login");
+      const msg = document.getElementById("login-msg");
+
+      // 只允许站内跳转，挡掉 ?next=https://evil.com 这类开放重定向
+      const rawNext = new URLSearchParams(location.search).get("next") || "/";
+      const next = rawNext.startsWith("/") && !rawNext.startsWith("//") ? rawNext : "/";
+
+      function fail(text) {
+        msg.textContent = text;
+        msg.hidden = false;
+        input.select();
+      }
+
+      form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const token = input.value.trim();
+        if (!token) { fail("请输入口令"); return; }
+
+        btn.disabled = true;
+        msg.hidden = true;
+        try {
+          const res = await fetch("/api/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ token }),
+            credentials: "same-origin",
+          });
+          if (!res.ok) {
+            const body = await res.json().catch(() => ({}));
+            fail(body.detail || `登录失败（HTTP ${res.status}）`);
+            return;
+          }
+          location.replace(next);
+        } catch {
+          fail("网络错误，请重试");
+        } finally {
+          btn.disabled = false;
+        }
+      });
+
+      input.focus();
+    })();
+  </script>
+</body>
+</html>
