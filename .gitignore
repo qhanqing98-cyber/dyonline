@@ -68,3 +68,7 @@ test-results/
 playwright-report/
 blob-report/
 .playwright/
+
+# ---- 本地测试文件（不入库）----
+/tests/
+/test/

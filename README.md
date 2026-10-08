@@ -53,7 +53,7 @@ dyonline/
 ## 环境要求
 
 - **Python** 3.10+
-- **微软 Edge 浏览器**（抖音下载依赖系统自带 Edge，Playwright 使用 `channel="msedge"` 无头启动）
+- **浏览器**：Windows 默认 Edge；Linux 容器默认 Playwright Chromium。可用 `DOUYIN_BROWSER_CHANNEL` 指定。
 - **ffmpeg**（仅 B 站 1080P 高清下载需要，需加入系统 PATH）
 
 ---
@@ -154,7 +154,7 @@ uvicorn app.main:app --reload
 
 ### 抖音
 1. 解析分享链接/口令，提取 `aweme_id`。
-2. Playwright 无头启动 Edge 打开作品页，浏览器自动完成反爬 JS（签名/验证 cookie）。
+2. Playwright 无头启动浏览器打开作品页，收到页面响应后独立等待视频数据；遇到登录或验证码时可能失败。
 3. 拦截详情接口 `/aweme/v1/web/aweme/detail/` 的响应，从 `aweme_detail.video.play_addr.url_list` 取无水印直链。
 4. 用 `requests` 带 `Referer` 流式下载到本地。
 
@@ -173,3 +173,115 @@ uvicorn app.main:app --reload
 - 抖音下载依赖系统 Edge 浏览器，首次使用请确保已安装 Edge。
 - B 站 1080P 高清下载需登录 Cookie（`SESSDATA` 等）且本机已安装 ffmpeg。
 - 下载的文件统一保存在 `downloads/` 目录（或 `-o` 指定的目录），同名文件会自动跳过。
+
+
+## 服务器视频定期清理
+
+Web 服务默认保留下载文件 **24 小时**，**每小时检查一次**，第一次检查在启动一小时后进行。
+年龄按文件最后修改时间计算，所以重启后仍能清理之前留下的视频和失败下载的媒体临时文件。
+实际删除可能比保留时间晚一个检查周期；有后台下载或 `/files/` 文件传输时，本轮跳过，下轮重试。
+清理仅针对 `downloads/` 顶层的 `.mp4`、`.m4s`、`.webm`、`.m4a`、`.part`、`.ytdl` 文件，
+不递归删除目录，不跟随符号链接，不清理其他扩展名。
+任务记录和日志保留；已删除文件的链接从 API 返回中移除，已打开的页面需要刷新。
+
+| 环境变量 | 默认值 | 作用 |
+|---|---|---|
+| `DOWNLOAD_RETENTION_HOURS` | `24` | 非负整数小时；`0` 关闭自动清理 |
+| `DOWNLOAD_CLEANUP_INTERVAL_SECONDS` | `3600` | 正整数秒，控制检查间隔 |
+
+Linux 启动示例（保留 48 小时）：
+
+```bash
+DOWNLOAD_RETENTION_HOURS=48 DOWNLOAD_CLEANUP_INTERVAL_SECONDS=3600 \
+uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+```
+
+目前任务仓库和清理保护都在进程内，服务器使用 **一个 worker、一个应用实例**。
+多个实例或 CLI 不应同时向这个受清理的目录写文件。清理由应用自行调度，无需额外安装 cron。
+Caddy 应将 `/files/*` 也反向代理给本应用，避免直接读取下载目录而绕过传输保护。
+
+```mermaid
+flowchart LR
+    A[用户提交链接] --> B[后台下载：登记活动]
+    B --> C[downloads 视频文件]
+    C --> D[用户取文件：登记活动]
+    E[每小时检查] --> F{是否有活动?}
+    F -->|有| G[跳过本轮]
+    F -->|无| H[删除超过保留时间的媒体文件]
+    H --> I[移除任务里的失效链接]
+```
+
+
+## Caddy：8080 对外，代理 app 容器的 8000
+
+仓库的 `Caddyfile` 内容如下：
+
+```caddyfile
+:8080 {
+    reverse_proxy app:8000
+}
+```
+
+- `:8080`：Caddy 在 8080 端口接收 HTTP 请求。
+- `reverse_proxy app:8000`：将所有路径（首页、API、静态资源、视频文件）转发给 `app` 容器的 8000 端口。
+- Caddy 容器与 `app` 容器必须连接同一个 Docker 网络，`app` 为服务名或网络别名。
+- app 容器内启动命令：`uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1`。
+- Caddy 容器端口映射：`8080:8080`；将此文件挂载到 `/etc/caddy/Caddyfile`。
+- app 的 8000 端口供容器网络访问，无需映射到公网。
+- 在 app 容器设置上述清理环境变量，并确保挂载的下载目录允许应用删除文件。
+
+若 Caddy 运行在宿主机上，则将 app 的端口映射为 `127.0.0.1:8000:8000`，
+并将代理目标改为 `127.0.0.1:8000`。
+
+更新服务器配置前可在 Caddy 容器运行：
+
+```bash
+caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+```
+
+本仓库原先没有 Docker 部署文件；这里提供代理配置与接入要求，需接入服务器现有容器部署。
+语法参考：https://caddyserver.com/docs/caddyfile/directives/reverse_proxy
+
+```mermaid
+flowchart LR
+    U[浏览器：服务器地址:8080] --> C[Caddy :8080]
+    C --> A[app 容器 :8000]
+    A --> V[downloads 视频目录]
+```
+
+
+## 抖音容器排查：Page.goto 超时
+
+出现 `Page.goto: Timeout ... waiting until "domcontentloaded"` 表示浏览器已启动，
+但导航没有在规定时间达到该加载阶段，不能仅凭此错误认定缺少浏览器或触发验证码。
+当前实现改用 `wait_until="commit"`（收到页面响应、开始加载文档），然后单独等作品详情。
+即使导航超时也尝试使用已经收到的数据；失败时记录页面状态、关键请求错误和标题。
+`blob:` 视频地址不交给 requests 下载，因为它只在浏览器内有效。
+
+| 环境变量 | 默认值 | 作用 |
+|---|---|---|
+| `DOUYIN_BROWSER_CHANNEL` | Windows: `msedge`；Linux: `chromium` | 选择已安装的浏览器 |
+| `DOUYIN_NAVIGATION_TIMEOUT_MS` | `30000` | 正整数毫秒，等待页面初始响应 |
+| `DOUYIN_MEDIA_TIMEOUT_MS` | `30000` | 正整数毫秒，单独等待视频数据 |
+
+在 Linux 镜像构建期间，安装 Python 依赖后安装浏览器及系统依赖：
+
+```dockerfile
+RUN python -m playwright install --with-deps chromium
+```
+
+安装与运行需要使用一致的 Playwright 版本，并确保运行用户能够访问浏览器安装目录。
+安装方式参考：https://playwright.dev/python/docs/browsers
+
+服务器上先检查 app 容器到抖音的网络（按实际容器名称替换 `app`）：
+
+```bash
+docker exec app python -c "import requests; r=requests.get('https://www.douyin.com/', timeout=20); print(r.status_code)"
+```
+
+这个检查仅验证 requests 到首页的连接，HTTP 200 也不能证明 Chromium 能拿到视频详情。
+若提示 DNS、连接超时或证书错误，先处理容器出口网络；若浏览器日志出现登录/验证页面，
+需要进一步确认平台访问要求。Caddy 的 8080→8000 是用户访问本应用的入口，
+抖音抓取则由 app 容器直接向外请求。
+Web 入口当前没有启用 `cookies_browser`，所以不会自动通过本机浏览器 Cookie 启用 yt-dlp 兜底。

@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from threading import Lock
 from uuid import uuid4
+from urllib.parse import unquote
 
 
 @dataclass
@@ -78,3 +79,12 @@ class TaskStore:
             task = self.tasks.get(task_id)
             if task and url not in task.files:
                 task.files.append(url)
+    def remove_files(self, names: list[str]) -> None:
+        # 清理磁盘文件后，同步移除任务里的失效链接，保留任务和日志。
+        removed = set(names)
+        if not removed:
+            return
+        with self.lock:
+            for task in self.tasks.values():
+                task.files = [url for url in task.files
+                              if unquote(url.rsplit("/", 1)[-1]) not in removed]

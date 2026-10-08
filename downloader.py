@@ -26,10 +26,13 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import requests
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import (
+    Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError, sync_playwright,
+)
 
 import bilibili
 
@@ -126,52 +129,81 @@ def extract_media(detail):
     }
 
 
-def fetch_video_info(page, aweme_id):
-    """打开作品页，拦截详情接口返回作品数据。"""
+def fetch_video_info(page, aweme_id, log_cb=None):
+    """先接收页面响应，再独立等待详情数据，不依赖整个页面加载完成。"""
     captured = {}
+    diagnostics = []
+    navigation_ms = int(os.getenv("DOUYIN_NAVIGATION_TIMEOUT_MS", "30000"))
+    media_ms = int(os.getenv("DOUYIN_MEDIA_TIMEOUT_MS", "30000"))
+    if navigation_ms <= 0 or media_ms <= 0:
+        raise ValueError("抖音导航和数据等待时间必须为正整数毫秒")
 
     def on_response(resp):
-        if captured:
+        if captured or "aweme/v1/web/aweme/detail" not in resp.url:
             return
-        if "aweme/v1/web/aweme/detail" in resp.url:
-            try:
-                d = resp.json()
-                if d.get("aweme_detail"):
-                    captured["detail"] = d["aweme_detail"]
-            except Exception:
-                pass
+        diagnostics.append(f"详情接口 HTTP {resp.status}")
+        try:
+            data = resp.json()
+            if isinstance(data, dict) and isinstance(data.get("aweme_detail"), dict) and data["aweme_detail"]:
+                captured["detail"] = data["aweme_detail"]
+            else:
+                diagnostics.append("详情接口未返回作品数据")
+        except (PlaywrightError, ValueError):
+            diagnostics.append("详情接口不是有效 JSON")
+
+    def on_failed(request):
+        # 只记录关键请求，不把 Cookie、查询参数或完整接口响应写进日志。
+        if request.resource_type == "document" or "aweme/v1/web/aweme/detail" in request.url:
+            diagnostics.append(f"关键请求失败: {request.failure}")
 
     page.on("response", on_response)
+    page.on("requestfailed", on_failed)
     try:
-        page.goto(f"https://www.douyin.com/video/{aweme_id}",
-                  wait_until="domcontentloaded", timeout=60000)
-        for _ in range(12):
-            if captured:
+        try:
+            response = page.goto(f"https://www.douyin.com/video/{aweme_id}",
+                                 wait_until="commit", timeout=navigation_ms)
+            if response is not None:
+                _emit(log_cb, f"[*] 页面响应: HTTP {response.status}，等待视频数据")
+        except PlaywrightTimeoutError:
+            _emit(log_cb, "[!] 页面导航超时，继续检查已收到的视频数据")
+        # 导航等待期间可能已经收到详情，优先使用，避免无谓读取页面。
+        deadline = time.monotonic() + media_ms / 1000
+        while True:
+            if "detail" in captured:
+                return extract_media(captured["detail"])
+            try:
+                src = page.evaluate(
+                    "() => { const v=document.querySelector('video');"
+                    " return v ? (v.currentSrc||v.src) : null }"
+                )
+                # blob 地址仅在浏览器上下文有效，requests 无法下载。
+                if (isinstance(src, str) and src.startswith(("https://", "http://"))
+                        and "douyinstatic" not in src and "uuu_" not in src):
+                    return {"desc": aweme_id, "author": "", "candidates": [src],
+                            "is_image_post": False, "image_count": 0}
+            except PlaywrightError:
+                # 页面重定向时执行上下文可能暂时不存在，下轮重试。
+                pass
+            remaining_ms = (deadline - time.monotonic()) * 1000
+            if remaining_ms <= 0:
                 break
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(min(1000, remaining_ms))
+
+        try:
+            title = page.title().strip()[:100]
+        except PlaywrightError:
+            title = "无法读取"
+        for message in list(dict.fromkeys(diagnostics))[-6:]:
+            _emit(log_cb, f"[!] {message}")
+        _emit(log_cb, f"[!] 页面标题: {title or '空'}")
+        if page.url == "about:blank":
+            raise RuntimeError("抖音页面未打开；请检查容器的 DNS、出口网络、代理及 TLS 连接")
+        raise RuntimeError(
+            "未获取到视频数据；请根据页面标题和请求日志检查网络、登录/验证码、作品可见性"
+        )
     finally:
         page.remove_listener("response", on_response)
-
-    if "detail" in captured:
-        return extract_media(captured["detail"])
-
-    # 兜底: 直接读 <video> 标签地址
-    for _ in range(10):
-        src = page.evaluate(
-            "() => { const v=document.querySelector('video');"
-            " return v ? (v.currentSrc||v.src) : null }"
-        )
-        if src and "douyinstatic" not in src and "uuu_" not in src:
-            try:
-                desc = page.evaluate(
-                    "() => { const e=document.querySelector('h1');"
-                    " return e ? e.innerText.trim() : null }"
-                )
-            except Exception:
-                desc = None
-            return {"desc": desc or aweme_id, "author": "",
-                    "candidates": [src], "is_image_post": False, "image_count": 0}
-    raise RuntimeError("未能获取视频数据(可能触发验证码，可加 --cookies-from-browser edge 兜底)")
+        page.remove_listener("requestfailed", on_failed)
 
 
 # ---------------------------------------------------------------------------
@@ -269,11 +301,14 @@ def download_douyin(session, link, outdir, use_ytdlp=False,
     _emit(log_cb, f"[*] 视频 ID: {aweme_id}")
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(channel="msedge", headless=True)
+            # Windows 默认使用 Edge；Linux 容器使用安装好的 Chromium。
+            channel = os.getenv("DOUYIN_BROWSER_CHANNEL", "msedge" if os.name == "nt" else "chromium")
+            _emit(log_cb, f"[*] 浏览器: {channel}")
+            browser = p.chromium.launch(channel=channel, headless=True)
             try:
                 ctx = browser.new_context(user_agent=USER_AGENT, locale="zh-CN")
                 page = ctx.new_page()
-                media = fetch_video_info(page, aweme_id)
+                media = fetch_video_info(page, aweme_id, log_cb=log_cb)
             finally:
                 browser.close()
         return process_media(media, aweme_id, outdir, session,

@@ -1,0 +1,4 @@
+# Caddy 与 app 容器需处于同一个 Docker 网络。
+:8080 {
+    reverse_proxy app:8000
+}

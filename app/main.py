@@ -1,5 +1,7 @@
 # app/main.py
+import os
 import re
+from contextlib import asynccontextmanager
 import threading
 from dataclasses import asdict
 from pathlib import Path
@@ -15,14 +17,32 @@ from pydantic import BaseModel
 import bilibili
 import downloader
 from app.task_store import TaskStore
+from app.cleanup import DownloadCleanup, ProtectFileTransfers
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="Video Downloader Web")
-templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 store = TaskStore()
+cleanup = DownloadCleanup(
+    DOWNLOAD_DIR, store,
+    retention_seconds=int(os.getenv("DOWNLOAD_RETENTION_HOURS", "24")) * 3600,
+    interval_seconds=int(os.getenv("DOWNLOAD_CLEANUP_INTERVAL_SECONDS", "3600")),
+)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    cleanup.start()
+    try:
+        yield
+    finally:
+        cleanup.stop()
+
+
+app = FastAPI(title="Video Downloader Web", lifespan=lifespan)
+app.add_middleware(ProtectFileTransfers, cleanup=cleanup)
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 app.mount("/files", StaticFiles(directory=str(DOWNLOAD_DIR)), name="files")
@@ -41,6 +61,12 @@ def home(request: Request):
 
 
 def _run_task(task_id: str) -> None:
+    # 下载全程受保护；不持有锁进行网络请求，多个下载仍可并发。
+    with cleanup.protect():
+        _run_task_protected(task_id)
+
+
+def _run_task_protected(task_id: str) -> None:
     """在后台线程里执行下载任务，通过回调把进度/日志写回 TaskStore。"""
     task = store.get(task_id)
     if task is None:
@@ -91,6 +117,8 @@ def _run_task(task_id: str) -> None:
     except Exception as e:
         store.update(task_id, status="failed", phase="done", error=str(e))
         log(f"[x] 任务异常: {e}")
+    finally:
+        session.close()
 
 
 @app.post("/api/tasks")
