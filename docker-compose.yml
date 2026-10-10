@@ -53,6 +53,11 @@ services:
     image: caddy:2-alpine
     container_name: dyonline-caddy
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     depends_on:
       app:
         condition: service_healthy     # 等 app 探活通过再启动，避免启动即 502

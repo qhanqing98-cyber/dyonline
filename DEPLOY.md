@@ -190,3 +190,61 @@ docker compose down
 - [ ] `MAX_CONCURRENCY` 与服务器内存匹配
 - [ ] 不对外公开宣传，避免被爬虫和滥用者盯上
 - [ ] 遵守平台服务条款与当地法律，仅用于下载自己有权保存的内容
+
+
+## 九、运维日志
+
+应用运维日志采用单行 JSON 输出到 stdout，Docker 负责收集；网页任务日志继续存 SQLite，
+保持每个任务最多 500 条。日志时间为带时区的 UTC，查看时可换算为本地时间。
+`LOG_LEVEL=INFO` 为默认值，可设 `DEBUG / INFO / WARNING / ERROR / CRITICAL`；
+无效值回退 INFO 并记录配置警告。DEBUG 会增加日志量，建议排查结束后恢复 INFO。
+
+常用日志字段：`time`、`level`、`module`、`event`、`message`。
+请求记录包含 `request_id`、方法、路径、状态码、耗时、响应是否完成及是否检测到断线；
+任务记录包含 `task_id`，并按事件补充平台、阶段、状态和耗时。
+请求 ID 由服务端生成，正常响应头 `X-Request-ID` 可用于查询对应日志。
+创建任务的记录同时带请求 ID 与任务 ID；线程池复制上下文，让后台日志可追溯到提交请求。
+HTTP 耗时覆盖响应传输过程，因此下载文件的耗时包含向用户传输的时间。
+未处理异常保留后台堆栈，继续交由框架处理；异常 500 响应不保证带 `X-Request-ID`。
+
+```bash
+# 查看最近 30 分钟、最多 200 条应用日志，并继续跟踪
+# --no-log-prefix 让每行保持可独立解析的 JSON
+docker compose logs --no-log-prefix --since 30m --tail 200 -f app
+
+# 查看 Caddy 访问日志（采用 Caddy 原生字段，如 request、status、duration）
+docker compose logs --no-log-prefix --since 30m --tail 200 caddy
+
+# 按任务 ID 搜索（替换为真实任务 ID）
+docker compose logs --no-log-prefix --since 24h app | grep -F '任务ID'
+
+# 按请求 ID 搜索（替换为响应头中的 ID）
+docker compose logs --no-log-prefix --since 1h app | grep -F '请求ID'
+```
+
+关键事件包括：`task_created`、`task_started`、`task_finished`、`download_log`、
+`queue_rejected`、`disk_rejected`、`http_request`、`request_exception`、
+`cleanup_finished`、`cleanup_exception` 和 `external_tool_finished`。
+正常探活与静态资源请求在 app 中仅记 DEBUG；Caddy 的访问日志仍会记录它们。
+清理汇总记录删除数量、释放字节数、失败数量和耗时；忙碌跳过以及单文件详情仅记 DEBUG。
+yt-dlp 服务模式输出会接入任务日志并降低进度刷屏频率，退出码记录在运维日志；
+ffmpeg 失败记录脱敏后的 stderr 末尾，最多 8KB。
+
+应用输出、异常、任务消息和外部工具输出经过共用脱敏处理；日志里的 URL 查询值被隐藏，
+配置口令、Cookie 和 Authorization 被遮蔽。不记录请求体、完整环境配置或请求头。
+Caddy 访问日志去掉 URI 查询串并移除请求和响应头字段。
+CLI 保留终端进度；上述 JSON 格式主要针对 Web 服务。
+
+app 与 Caddy 都采用 Docker `json-file` 驱动，`max-size=10m`、`max-file=3`。
+这是每个容器的容量轮转，不是固定天数；日志越多，保留的时间越短。
+删除或重新创建容器可能丢失旧日志，单纯重启现有容器通常仍可查看保留内容。
+SQLite 任务日志存于 data 卷，与 Docker 运维日志采用不同的保存方式。
+
+配置更改后需要重新创建容器使日志驱动配置生效；更新命令由运维人员执行：
+
+```bash
+docker compose up -d --build
+```
+
+本次无需数据库迁移。已有历史任务日志不会批量改写；历史记录中若曾出现敏感值，
+需另行处理，不能认为新增脱敏机制已清理过去写入的数据。

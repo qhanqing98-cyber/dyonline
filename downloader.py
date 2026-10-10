@@ -22,6 +22,7 @@
 """
 
 import argparse
+import logging
 import os
 import re
 import subprocess
@@ -36,6 +37,7 @@ from playwright.sync_api import (
 
 import bilibili
 from app import config
+from app.logging_setup import redact, set_log_context
 
 # 模拟新版 Edge/Chrome 浏览器 UA
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -55,7 +57,7 @@ def _emit(log_cb, msg):
     if log_cb:
         log_cb(msg)
     else:
-        print(msg)
+        print(redact(msg))
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +302,7 @@ def sanitize(name, fallback):
 
 
 def ytdlp_download(link, outdir, cookies_browser, log_cb=None):
+    set_log_context(stage="yt_dlp")
     cmd = [
         sys.executable, "-m", "yt_dlp",
         "-f", "best",
@@ -311,7 +314,39 @@ def ytdlp_download(link, outdir, cookies_browser, log_cb=None):
     _emit(log_cb, "[*] 使用 yt-dlp 兜底下载...")
     # Windows 下隐藏子进程黑框(打包成 GUI 后不闪 console)
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-    return subprocess.run(cmd, creationflags=flags).returncode == 0
+    started = time.monotonic()
+    if log_cb is None:
+        # 命令行仍直接显示子进程进度，保留现有交互。
+        code = subprocess.run(cmd, creationflags=flags).returncode
+    else:
+        cmd[3:3] = ["--newline"]
+        last_progress = float("-inf")
+        with subprocess.Popen(cmd, creationflags=flags, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True,
+                              encoding="utf-8", errors="replace") as process:
+            try:
+                for line in process.stdout:
+                    message = line.strip()
+                    if not message:
+                        continue
+                    if re.match(r"\[download\]\s+\d", message):
+                        now = time.monotonic()
+                        if now - last_progress < 2 and not re.search(r"100(?:\.0)?%", message):
+                            continue
+                        last_progress = now
+                    _emit(log_cb, redact(message)[:8192])
+            except BaseException:
+                process.terminate()
+                raise
+            code = process.wait()
+    logging.getLogger(__name__).log(
+        logging.INFO if code == 0 else logging.ERROR, "yt-dlp 执行结束",
+        extra={"event": "external_tool_finished", "fields": {
+            "tool": "yt-dlp", "exit_code": code,
+            "duration_ms": round((time.monotonic() - started) * 1000, 2),
+        }},
+    )
+    return code == 0
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +381,7 @@ def process_media(media, aweme_id, outdir, session,
                 return True
             _emit(log_cb, f"[!] 第 {idx + 1} 个地址内容过小({size}B)，尝试下一个")
         except Exception as e:
+            logging.getLogger(__name__).warning("候选地址下载失败", exc_info=True, extra={"event": "download_candidate_failed"})
             _emit(log_cb, f"[!] 第 {idx + 1} 个地址下载失败: {e}")
     raise RuntimeError("所有候选视频地址均下载失败")
 
@@ -359,18 +395,22 @@ def download_douyin(session, link, outdir, use_ytdlp=False,
     """
     if use_ytdlp:
         return ytdlp_download(link, outdir, cookies_browser, log_cb=log_cb)
+    set_log_context(stage="resolve_link")
     aweme_id = extract_aweme_id(link)
     _emit(log_cb, f"[*] 视频 ID: {aweme_id}")
     try:
+        set_log_context(stage="browser_start")
         with sync_playwright() as p:
             _emit(log_cb, f"[*] 浏览器: {engine or os.getenv("DOUYIN_BROWSER_CHANNEL") or config.DOUYIN_ENGINE}")
             browser = _launch_browser(p, engine)
             try:
                 ctx = _new_context(browser)
                 page = ctx.new_page()
+                set_log_context(stage="fetch_detail")
                 media = fetch_video_info(page, aweme_id, log_cb=log_cb)
             finally:
                 browser.close()
+        set_log_context(stage="download")
         return process_media(media, aweme_id, outdir, session,
                              log_cb=log_cb, progress_cb=progress_cb)
     except Exception as e:

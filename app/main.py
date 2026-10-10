@@ -1,7 +1,9 @@
 # app/main.py
 import os
+import logging
 import re
 from contextlib import asynccontextmanager
+from contextvars import copy_context
 import shutil
 import threading
 import time
@@ -26,9 +28,15 @@ import downloader
 from app import auth, config
 from app.task_store import TaskStore
 from app.cleanup import DownloadCleanup, ProtectFileTransfers
+from app.logging_setup import (
+    configure_logging, RequestLoggingMiddleware, log_context,
+    set_log_context, redact, message_level,
+)
 
 DOWNLOAD_DIR = config.DOWNLOAD_DIR
 
+configure_logging()
+logger = logging.getLogger(__name__)
 store = TaskStore()
 cleanup = DownloadCleanup(
     DOWNLOAD_DIR, store,
@@ -39,14 +47,17 @@ cleanup = DownloadCleanup(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("服务启动", extra={"event": "service_started", "fields": {"max_concurrency": config.MAX_CONCURRENCY, "queue_limit": config.QUEUE_LIMIT}})
     cleanup.start()
     try:
         yield
     finally:
+        logger.info("服务开始关闭", extra={"event": "service_stopping"})
         cleanup.stop()
         # 等下载任务退出后再关数据库，避免后台线程访问已关闭连接。
         _pool.shutdown(wait=True)
         store.close()
+        logger.info("服务已关闭", extra={"event": "service_stopped"})
 
 
 app = FastAPI(title="Video Downloader Web", lifespan=lifespan)
@@ -60,6 +71,7 @@ app.mount("/static", StaticFiles(directory=str(config.BASE_DIR / "static")), nam
 
 # 访问鉴权中间件（config.ACCESS_TOKEN 为空时内部直接放行，等于关闭）
 app.add_middleware(auth.AuthMiddleware)
+app.add_middleware(RequestLoggingMiddleware)
 
 # 从下载日志里解析“已保存”的文件路径，用于生成前端下载链接
 _SAVED_RE = re.compile(r"\[OK\] 已保存:\s*(.+?)\s*\(\d+ bytes\)")
@@ -98,15 +110,27 @@ def home(request: Request):
 def _run_task(task_id: str) -> None:
     """保护下载全程，并确保提前失败时也释放排队名额。"""
     global _pending
-    try:
-        with cleanup.protect():
-            _run_task_protected(task_id)
-    except Exception as exc:
-        store.update(task_id, status="failed", phase="done", error=str(exc))
-        store.append_log(task_id, f"[x] 任务异常: {exc}")
-    finally:
-        with _pending_lock:
-            _pending -= 1
+    started = time.monotonic()
+    with log_context(task_id=task_id, stage="task"):
+        logger.info("任务开始执行", extra={"event": "task_started"})
+        try:
+            with cleanup.protect():
+                _run_task_protected(task_id)
+        except Exception as exc:
+            store.update(task_id, status="failed", phase="done", error=redact(exc))
+            store.append_log(task_id, f"[x] 任务异常: {exc}")
+            logger.exception("任务执行异常", extra={"event": "task_exception"})
+        finally:
+            try:
+                task = store.get(task_id)
+                logger.log(logging.INFO if task and task.status == "done" else logging.ERROR,
+                           "任务执行结束", extra={"event": "task_finished", "fields": {
+                               "status": task.status if task else "missing",
+                               "duration_ms": round((time.monotonic() - started) * 1000, 2),
+                           }})
+            finally:
+                with _pending_lock:
+                    _pending -= 1
 
 
 def _run_task_protected(task_id: str) -> None:
@@ -116,21 +140,25 @@ def _run_task_protected(task_id: str) -> None:
         return
     links = list(task.links)
 
-    def log(msg: str) -> None:
-        store.append_log(task_id, msg)
+    def log(msg: str, *, exc_info=False) -> None:
+        # 文件识别在脱敏前执行；仅日志和对外错误使用脱敏文本。
         m = _SAVED_RE.search(msg)
         if m:
             # 只存文件名；下载走 GET /api/tasks/{id}/files/{name}（带归属校验）
             fname = Path(m.group(1)).name
             store.add_file(task_id, fname)
+        store.append_log(task_id, msg)
+        logger.log(message_level(msg), msg, exc_info=exc_info, extra={"event": "download_log"})
 
     def progress(pct: int, phase: str = "") -> None:
         # 进度回调频次很高，写库节流已在 TaskStore.update 内部做掉，这里直接转发
+        set_log_context(stage=phase or "download")
         store.update(task_id, progress=pct, phase=phase)
 
     # 磁盘保护：剩余空间不足直接拒绝，防止把服务器写满导致整个服务挂掉
     free_mb = shutil.disk_usage(DOWNLOAD_DIR).free // (1024 * 1024)
     if free_mb < config.MIN_FREE_MB:
+        logger.warning("磁盘不足，拒绝下载", extra={"event": "disk_rejected", "fields": {"disk_free_mb": free_mb, "min_free_mb": config.MIN_FREE_MB}})
         store.update(task_id, status="failed", phase="done",
                      error=f"磁盘剩余空间不足（{free_mb}MB < {config.MIN_FREE_MB}MB），任务拒绝执行")
         return
@@ -145,30 +173,32 @@ def _run_task_protected(task_id: str) -> None:
     total = len(links)
     try:
         for link in bili_links:
+            set_log_context(platform="bilibili", stage="fetch_detail")
             log(f"[输入] {link[:80]}")
             try:
                 if bilibili.process_bilibili(
                         session, link, DOWNLOAD_DIR, log_cb=log, progress_cb=progress):
                     ok += 1
             except Exception as e:
-                log(f"[x] 失败: {e}")
+                log(f"[x] 失败: {e}", exc_info=True)
 
         for link in dy_links:
+            set_log_context(platform="douyin", stage="fetch_detail")
             log(f"[输入] {link[:80]}")
             try:
                 if downloader.download_douyin(
                         session, link, DOWNLOAD_DIR, log_cb=log, progress_cb=progress):
                     ok += 1
             except Exception as e:
-                log(f"[x] 失败: {e}")
+                log(f"[x] 失败: {e}", exc_info=True)
 
         status = "done" if ok == total else "failed"
         store.update(task_id, status=status, progress=100, phase="done")
         if ok != total:
             store.update(task_id, error=f"仅 {ok}/{total} 个链接下载成功")
     except Exception as e:
-        store.update(task_id, status="failed", phase="done", error=str(e))
-        log(f"[x] 任务异常: {e}")
+        store.update(task_id, status="failed", phase="done", error=redact(e))
+        log(f"[x] 任务异常: {e}", exc_info=True)
     finally:
         session.close()
 
@@ -181,12 +211,15 @@ def create_task(body: TaskRequest):
         raise HTTPException(status_code=400, detail="链接列表不能为空")
     with _pending_lock:
         if _pending >= config.QUEUE_LIMIT:
+            logger.warning("排队任务已满", extra={"event": "queue_rejected", "fields": {"queue_pending": _pending}})
             raise HTTPException(status_code=429,
                                 detail="服务器繁忙：排队任务已满，请稍后再试")
         _pending += 1
     try:
         task = store.create(links)
-        _pool.submit(_run_task, task.id)
+        logger.info("任务已创建", extra={"event": "task_created", "fields": {"task_id": task.id, "link_count": len(links)}})
+        context = copy_context()
+        _pool.submit(context.run, _run_task, task.id)
     except Exception:
         with _pending_lock:
             _pending -= 1

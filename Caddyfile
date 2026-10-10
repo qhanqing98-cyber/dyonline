@@ -1,5 +1,16 @@
 # Caddy 对外监听 8080，代理同一 Docker 网络内 app 的 8000。
 :8080 {
+    log {
+        output stdout
+        format filter {
+            wrap json
+            fields {
+                request>headers delete
+                resp_headers delete
+                request>uri regexp "[?].*$" ""
+            }
+        }
+    }
     encode gzip
     request_body {
         max_size 256KB

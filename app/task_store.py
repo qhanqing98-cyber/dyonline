@@ -8,6 +8,9 @@ app/main.py 无需感知存储从 dict 换成了 SQLite。
 注意：必须以单 worker 运行（uvicorn --workers 1）。
 并发下载由 ThreadPoolExecutor 控制，多 worker 会让任务队列分叉、状态互不可见。
 """
+import logging
+from app.logging_setup import redact
+
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from json import dumps, loads
@@ -153,7 +156,7 @@ class TaskStore:
         )
         self.conn.commit()
         if cur.rowcount:
-            print(f"[task_store] 已将 {cur.rowcount} 个中断任务标记为失败")
+            logging.getLogger(__name__).warning("恢复中断任务", extra={"event": "tasks_interrupted", "fields": {"count": cur.rowcount}})
 
     # ------------------------------------------------------------------
     # 对外接口（签名与旧内存版完全一致，main.py 无需改动）
@@ -210,7 +213,7 @@ class TaskStore:
             if key not in self._UPDATABLE:
                 raise ValueError(f"不支持更新的字段: {key}")
             sets.append(f"{key} = ?")
-            params.append(value)
+            params.append(redact(value) if key == "error" and value is not None else value)
         sets.append("updated_at = ?")
         params.append(_now())
         params.append(task_id)
@@ -226,6 +229,7 @@ class TaskStore:
             return self._row_to_task(row) if row else None
 
     def append_log(self, task_id: str, msg: str) -> None:
+        msg = redact(msg)
         with self.lock:
             exists = self.conn.execute(
                 "SELECT 1 FROM tasks WHERE id=?", (task_id,)

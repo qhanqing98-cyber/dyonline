@@ -15,11 +15,13 @@ B站(bilibili)视频下载器：纯 requests + wbi 签名，无浏览器依赖�
 import hashlib
 import re
 import subprocess
+import logging
 import time
 from pathlib import Path
 from urllib.parse import urlencode
 
 import requests
+from app.logging_setup import redact, set_log_context
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
@@ -49,7 +51,7 @@ def _emit(log_cb, msg):
     if log_cb:
         log_cb(msg)
     else:
-        print(msg)
+        print(redact(msg))
 
 
 def _get_mixin_key(orig):
@@ -198,11 +200,33 @@ def download_dash(session, data, out_path, log_cb=None, progress_cb=None):
                              if progress_cb else None)
             if progress_cb:
                 progress_cb(99, "merge")
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", str(tmp_v), "-i", str(tmp_a),
-                 "-c", "copy", str(out_path)],
-                check=True, capture_output=True,
-            )
+            started = time.monotonic()
+            set_log_context(stage="merge")
+            try:
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", str(tmp_v), "-i", str(tmp_a),
+                     "-c", "copy", str(out_path)],
+                    check=True, capture_output=True,
+                )
+            except subprocess.CalledProcessError as exc:
+                tail = exc.stderr or b""
+                if isinstance(tail, bytes):
+                    tail = tail.decode("utf-8", errors="replace")
+                safe_tail = redact(tail).encode("utf-8")[-8192:].decode("utf-8", errors="ignore")
+                logging.getLogger(__name__).exception(
+                    "ffmpeg 合并失败", extra={"event": "external_tool_failed", "fields": {
+                        "tool": "ffmpeg", "exit_code": exc.returncode,
+                        "stderr_tail": safe_tail,
+                        "duration_ms": round((time.monotonic() - started) * 1000, 2),
+                    }})
+                _emit(log_cb, "[x] ffmpeg 合并失败: " + safe_tail)
+                raise
+            else:
+                logging.getLogger(__name__).info("ffmpeg 合并完成", extra={
+                    "event": "external_tool_finished", "fields": {
+                        "tool": "ffmpeg", "exit_code": 0,
+                        "duration_ms": round((time.monotonic() - started) * 1000, 2),
+                    }})
         else:
             tmp_v.rename(out_path)
         if progress_cb:
@@ -292,6 +316,7 @@ def process_bilibili(session, link, outdir, p_choice=None, hd=False,
             _emit(log_cb, f"[OK] 已保存: {out_path} ({size} bytes)")
             ok += 1
         except Exception as e:
+            logging.getLogger(__name__).exception("B站分P下载失败", extra={"event": "download_exception"})
             _emit(log_cb, f"[x] 下载失败: {e}")
     return ok == len(idxs)
 

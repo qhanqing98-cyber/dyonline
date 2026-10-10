@@ -372,3 +372,15 @@ Web 入口当前没有启用 `cookies_browser`，所以不会自动通过本机�
 - **必须单 worker 运行**：任务队列与并发计数是进程私有的，`uvicorn --workers N` 会导致队列分叉；
   要提升吞吐请调大 `MAX_CONCURRENCY`。
 - **访问鉴权是单共享口令**，不是多用户账号体系：所有使用者共用同一口令、看到同一批任务。
+
+
+## 运维日志
+
+Web 服务输出单行 JSON 日志，由 Docker 收集。`LOG_LEVEL` 默认 `INFO`。
+可按 `request_id` 追踪一次请求，按 `task_id` 追踪后台下载；网页任务日志继续存 SQLite。
+Caddy 访问日志已开启；两种容器均按每个文件 10MB、最多 3 个轮转。
+查看与排错步骤见 [DEPLOY.md 的运维日志部分](DEPLOY.md#九运维日志)。
+
+```bash
+docker compose logs --no-log-prefix --since 30m --tail 200 -f app
+```
