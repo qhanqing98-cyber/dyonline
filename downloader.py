@@ -401,7 +401,7 @@ def download_douyin(session, link, outdir, use_ytdlp=False,
     try:
         set_log_context(stage="browser_start")
         with sync_playwright() as p:
-            _emit(log_cb, f"[*] 浏览器: {engine or os.getenv("DOUYIN_BROWSER_CHANNEL") or config.DOUYIN_ENGINE}")
+            _emit(log_cb, f"[*] 浏览器: {engine or os.getenv('DOUYIN_BROWSER_CHANNEL') or config.DOUYIN_ENGINE}")
             browser = _launch_browser(p, engine)
             try:
                 ctx = _new_context(browser)
