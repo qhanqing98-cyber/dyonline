@@ -1,5 +1,6 @@
 """下载目录的定期清理；与下载、HTTP 文件传输共用活动保护。"""
 import logging
+import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -34,6 +35,17 @@ class DownloadCleanup:
             with self.lock:
                 self.active -= 1
 
+    def _media_paths(self):
+        """只进入服务生成的两层 UUID 目录，不跟随符号链接。"""
+        for path in self.directory.iterdir():
+            yield path
+            if path.is_symlink() or not path.is_dir() or not re.fullmatch(r"[0-9a-f]{32}", path.name):
+                continue
+            for task_dir in path.iterdir():
+                if task_dir.is_symlink() or not task_dir.is_dir() or not re.fullmatch(r"[0-9a-f]{32}", task_dir.name):
+                    continue
+                yield from task_dir.iterdir()
+
     def cleanup_once(self) -> list[str]:
         """仅清理顶层过期媒体文件；忙碌时跳过，不跟随符号链接。"""
         if self.retention_seconds == 0:
@@ -47,7 +59,7 @@ class DownloadCleanup:
             if self.active:
                 logger.debug("清理因文件使用而跳过", extra={"event": "cleanup_skipped", "fields": {"active_count": self.active}})
                 return []
-            for path in self.directory.iterdir():
+            for path in self._media_paths():
                 if path.suffix.lower() not in MEDIA_SUFFIXES:
                     continue
                 try:
@@ -57,7 +69,7 @@ class DownloadCleanup:
                     if stat.st_mtime >= cutoff:
                         continue
                     path.unlink()
-                    removed.append(path.name)
+                    removed.append(path.relative_to(self.directory).as_posix())
                     released_bytes += stat.st_size
                     logger.debug("已清理过期下载文件: %s", path.name, extra={"event": "cleanup_file_deleted"})
                 except OSError:

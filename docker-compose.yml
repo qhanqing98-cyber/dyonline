@@ -3,7 +3,7 @@
 # 一键部署编排：应用 + Caddy（8080 入口）+ 数据持久化
 #
 # 用法：
-#   cp .env.example .env       # 填好 ACCESS_TOKEN / MAX_CONCURRENCY
+#   cp .env.example .env       # 填好 ADMIN_PASSWORD / MAX_CONCURRENCY
 #   docker compose up -d --build
 #   docker compose logs -f app
 #
@@ -29,7 +29,7 @@ services:
       - "127.0.0.1:8000:8000"
 
     volumes:
-      - ./data:/app/data               # SQLite 库：任务、进度、日志
+      - ./data:/app/data               # SQLite 库：账号、会话、任务、日志
       - ./downloads:/app/downloads     # 下载好的视频文件
 
     # Chromium 必需：Docker 默认 /dev/shm 只有 64MB，不加这个会「偶发崩溃」

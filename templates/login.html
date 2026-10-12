@@ -15,29 +15,32 @@
       <span class="brand-mark" aria-hidden="true">▶</span>
       <span class="brand-name">DY<em>·</em>ONLINE</span>
     </div>
-    <p class="login-sub">请输入访问口令</p>
+    <p class="login-sub">使用管理员分配的账号登录</p>
 
-    <form class="login-form" id="login-form" autocomplete="off">
-      <input id="token" type="password" placeholder="访问口令" aria-label="访问口令"
+    <form class="login-form" id="login-form">
+      <input id="username" name="username" type="text" placeholder="用户名" aria-label="用户名"
+             autocomplete="username" minlength="3" maxlength="32" required>
+      <input id="password" name="password" type="password" placeholder="密码" aria-label="密码" maxlength="256"
              autocomplete="current-password" required>
       <button type="submit" class="btn primary" id="btn-login">
         <span class="btn-label">进入下载台</span>
       </button>
     </form>
 
-    <p class="login-msg" id="login-msg" hidden></p>
+    <p class="login-msg" id="login-msg" role="alert" hidden></p>
   </main>
 
   <script>
     (function () {
       const form = document.getElementById("login-form");
-      const input = document.getElementById("token");
+      const usernameInput = document.getElementById("username");
+      const input = document.getElementById("password");
       const btn = document.getElementById("btn-login");
       const msg = document.getElementById("login-msg");
 
       // 只允许站内跳转，挡掉 ?next=https://evil.com 这类开放重定向
       const rawNext = new URLSearchParams(location.search).get("next") || "/";
-      const next = rawNext.startsWith("/") && !rawNext.startsWith("//") ? rawNext : "/";
+      const next = rawNext.startsWith("/") && !rawNext.startsWith("//") && !rawNext.includes("\\") ? rawNext : "/";
 
       function fail(text) {
         msg.textContent = text;
@@ -47,8 +50,9 @@
 
       form.addEventListener("submit", async (e) => {
         e.preventDefault();
-        const token = input.value.trim();
-        if (!token) { fail("请输入口令"); return; }
+        const username = usernameInput.value.trim();
+        const password = input.value;
+        if (!username || !password) { fail("请输入用户名和密码"); return; }
 
         btn.disabled = true;
         msg.hidden = true;
@@ -56,7 +60,7 @@
           const res = await fetch("/api/login", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ token }),
+            body: JSON.stringify({ username, password }),
             credentials: "same-origin",
           });
           if (!res.ok) {
@@ -72,7 +76,7 @@
         }
       });
 
-      input.focus();
+      usernameInput.focus();
     })();
   </script>
 </body>

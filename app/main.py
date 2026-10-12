@@ -17,7 +17,6 @@ from fastapi.responses import (
     FileResponse,
     HTMLResponse,
     JSONResponse,
-    RedirectResponse,
 )
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -27,6 +26,7 @@ import bilibili
 import downloader
 from app import auth, config
 from app.task_store import TaskStore
+from app.users import UserStore
 from app.cleanup import DownloadCleanup, ProtectFileTransfers
 from app.logging_setup import (
     configure_logging, RequestLoggingMiddleware, log_context,
@@ -37,7 +37,9 @@ DOWNLOAD_DIR = config.DOWNLOAD_DIR
 
 configure_logging()
 logger = logging.getLogger(__name__)
-store = TaskStore()
+users = UserStore()
+initial_admin = users.bootstrap()
+store = TaskStore(legacy_user_id=initial_admin.id if initial_admin else None)
 cleanup = DownloadCleanup(
     DOWNLOAD_DIR, store,
     retention_seconds=int(os.getenv("DOWNLOAD_RETENTION_HOURS", "24")) * 3600,
@@ -47,7 +49,7 @@ cleanup = DownloadCleanup(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("服务启动", extra={"event": "service_started", "fields": {"max_concurrency": config.MAX_CONCURRENCY, "queue_limit": config.QUEUE_LIMIT}})
+    logger.info("服务启动", extra={"event": "service_started", "fields": {"max_concurrency": config.MAX_CONCURRENCY, "queue_limit": config.QUEUE_LIMIT, "user_queue_limit": config.USER_QUEUE_LIMIT}})
     cleanup.start()
     try:
         yield
@@ -57,6 +59,7 @@ async def lifespan(app: FastAPI):
         # 等下载任务退出后再关数据库，避免后台线程访问已关闭连接。
         _pool.shutdown(wait=True)
         store.close()
+        users.close()
         logger.info("服务已关闭", extra={"event": "service_stopped"})
 
 
@@ -69,8 +72,8 @@ templates = Jinja2Templates(directory=str(config.BASE_DIR / "templates"))
 # 现在改为 /api/tasks/{id}/files/{name} 受控接口（见下方 get_task_file）。
 app.mount("/static", StaticFiles(directory=str(config.BASE_DIR / "static")), name="static")
 
-# 访问鉴权中间件（config.ACCESS_TOKEN 为空时内部直接放行，等于关闭）
-app.add_middleware(auth.AuthMiddleware)
+# 用户身份由服务端会话读取，绝不接受前端指定身份。
+app.add_middleware(auth.AuthMiddleware, users=users)
 app.add_middleware(RequestLoggingMiddleware)
 
 # 从下载日志里解析“已保存”的文件路径，用于生成前端下载链接
@@ -100,6 +103,19 @@ class TaskRequest(BaseModel):
 _pool = ThreadPoolExecutor(max_workers=config.MAX_CONCURRENCY, thread_name_prefix="dl")
 _pending_lock = threading.Lock()
 _pending = 0
+_user_pending: dict[str, int] = {}
+
+
+def _release_slot(user_id: str) -> None:
+    """成功、失败或提交异常都释放全局及用户名额；与准入共用一把锁。"""
+    global _pending
+    with _pending_lock:
+        _pending -= 1
+        remaining = _user_pending[user_id] - 1
+        if remaining:
+            _user_pending[user_id] = remaining
+        else:
+            del _user_pending[user_id]
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -107,13 +123,14 @@ def home(request: Request):
     return templates.TemplateResponse(request, "index.html")
 
 
-def _run_task(task_id: str) -> None:
+def _run_task(task_id: str, user_id: str) -> None:
     """保护下载全程，并确保提前失败时也释放排队名额。"""
-    global _pending
     started = time.monotonic()
-    with log_context(task_id=task_id, stage="task"):
-        logger.info("任务开始执行", extra={"event": "task_started"})
+    with log_context(task_id=task_id, user_id=user_id, stage="task"):
         try:
+            owned_task = store.get(task_id)
+            set_log_context(user_id=owned_task.user_id if owned_task else None)
+            logger.info("任务开始执行", extra={"event": "task_started"})
             with cleanup.protect():
                 _run_task_protected(task_id)
         except Exception as exc:
@@ -129,8 +146,7 @@ def _run_task(task_id: str) -> None:
                                "duration_ms": round((time.monotonic() - started) * 1000, 2),
                            }})
             finally:
-                with _pending_lock:
-                    _pending -= 1
+                _release_slot(user_id)
 
 
 def _run_task_protected(task_id: str) -> None:
@@ -139,6 +155,8 @@ def _run_task_protected(task_id: str) -> None:
     if task is None:
         return
     links = list(task.links)
+    outdir = task_directory(task)
+    outdir.mkdir(parents=True, exist_ok=True)
 
     def log(msg: str, *, exc_info=False) -> None:
         # 文件识别在脱敏前执行；仅日志和对外错误使用脱敏文本。
@@ -177,7 +195,7 @@ def _run_task_protected(task_id: str) -> None:
             log(f"[输入] {link[:80]}")
             try:
                 if bilibili.process_bilibili(
-                        session, link, DOWNLOAD_DIR, log_cb=log, progress_cb=progress):
+                        session, link, outdir, log_cb=log, progress_cb=progress):
                     ok += 1
             except Exception as e:
                 log(f"[x] 失败: {e}", exc_info=True)
@@ -187,7 +205,7 @@ def _run_task_protected(task_id: str) -> None:
             log(f"[输入] {link[:80]}")
             try:
                 if downloader.download_douyin(
-                        session, link, DOWNLOAD_DIR, log_cb=log, progress_cb=progress):
+                        session, link, outdir, log_cb=log, progress_cb=progress):
                     ok += 1
             except Exception as e:
                 log(f"[x] 失败: {e}", exc_info=True)
@@ -203,57 +221,81 @@ def _run_task_protected(task_id: str) -> None:
         session.close()
 
 
+def task_directory(task):
+    """旧任务继续读顶层文件；新任务使用用户/任务独立目录。"""
+    if task.storage_layout == "legacy":
+        return DOWNLOAD_DIR
+    if not re.fullmatch(r"[0-9a-f]{32}", task.user_id or "") or not re.fullmatch(r"[0-9a-f]{32}", task.id):
+        raise ValueError("任务存储标识非法")
+    directory = DOWNLOAD_DIR / task.user_id / task.id
+    if directory.parent.is_symlink() or directory.is_symlink():
+        raise ValueError("任务目录不允许符号链接")
+    return directory
+
+
 @app.post("/api/tasks")
-def create_task(body: TaskRequest):
+def create_task(body: TaskRequest, request: Request):
     global _pending
     links = [l.strip() for l in body.links if l and l.strip()]
     if not links:
         raise HTTPException(status_code=400, detail="链接列表不能为空")
+    user_id = request.state.user.id
     with _pending_lock:
+        user_pending = _user_pending.get(user_id, 0)
+        if user_pending >= config.USER_QUEUE_LIMIT:
+            logger.warning("当前用户未结束任务已达上限", extra={"event": "user_queue_rejected", "fields": {
+                "user_id": user_id, "user_pending": user_pending, "user_queue_limit": config.USER_QUEUE_LIMIT,
+            }})
+            raise HTTPException(status_code=429,
+                                detail=f"你已有 {user_pending} 个排队或下载中的任务（上限 {config.USER_QUEUE_LIMIT} 个），请等待任务结束后再提交")
         if _pending >= config.QUEUE_LIMIT:
             logger.warning("排队任务已满", extra={"event": "queue_rejected", "fields": {"queue_pending": _pending}})
             raise HTTPException(status_code=429,
                                 detail="服务器繁忙：排队任务已满，请稍后再试")
         _pending += 1
+        _user_pending[user_id] = user_pending + 1
+    task = None
     try:
-        task = store.create(links)
+        task = store.create(links, user_id=user_id)
         logger.info("任务已创建", extra={"event": "task_created", "fields": {"task_id": task.id, "link_count": len(links)}})
         context = copy_context()
-        _pool.submit(context.run, _run_task, task.id)
+        _pool.submit(context.run, _run_task, task.id, user_id)
     except Exception:
-        with _pending_lock:
-            _pending -= 1
+        _release_slot(user_id)
+        if task is not None:
+            store.update(task.id, status="failed", phase="done", error="任务提交失败，请重试")
+        logger.exception("任务创建或提交失败", extra={"event": "task_submission_failed"})
         raise
     return asdict(task)
 
 
 @app.get("/api/tasks")
-def list_tasks():
-    return [asdict(t) for t in store.all()]
+def list_tasks(request: Request):
+    return [asdict(t) for t in store.all(user_id=request.state.user.id)]
 
 
 @app.get("/api/tasks/{task_id}")
-def get_task(task_id: str):
-    task = store.get(task_id)
+def get_task(task_id: str, request: Request):
+    task = store.get(task_id, user_id=request.state.user.id)
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     return asdict(task)
 
 
 @app.get("/api/tasks/{task_id}/files/{filename}")
-def get_task_file(task_id: str, filename: str):
+def get_task_file(task_id: str, filename: str, request: Request):
     """受控下载接口：只允许取该任务自己产出的文件。
 
     安全三连：归属校验（403）→ 只取 basename 防路径穿越 → 存在性检查（404）。
     """
-    task = store.get(task_id)
+    task = store.get(task_id, user_id=request.state.user.id)
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     fname = Path(filename).name            # 防 ../../ 类路径穿越
     if fname not in task.files:
         raise HTTPException(status_code=403, detail="该文件不属于此任务")
-    path = DOWNLOAD_DIR / fname
-    if not path.is_file():
+    path = task_directory(task) / fname
+    if path.is_symlink() or not path.resolve().is_relative_to(task_directory(task).resolve()) or not path.is_file():
         raise HTTPException(status_code=404, detail="文件已不存在（可能已被清理）")
     return FileResponse(path, filename=fname, media_type="application/octet-stream")
 
@@ -277,32 +319,35 @@ def healthz():
 # ---------------------------------------------------------------------------
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
-    # 未启用鉴权时不该出现登录页，直接回首页，避免把使用者绕晕
-    if not auth.enabled():
-        return RedirectResponse("/", status_code=302)
     return templates.TemplateResponse(request, "login.html")
 
 
 class LoginRequest(BaseModel):
-    # 限长只是防御性约束，避免超长输入
-    token: str = Field(max_length=256)
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=1, max_length=256)
 
 
 @app.post("/api/login")
 def do_login(body: LoginRequest):
-    if not auth.enabled():
-        raise HTTPException(status_code=400, detail="服务端未启用访问口令")
-    if not auth.check_token(body.token):
-        time.sleep(0.8)          # 失败延迟：抬高暴力破解成本
-        # 统一文案，不区分具体原因，避免泄露内部信息
-        raise HTTPException(status_code=401, detail="口令错误")
+    user = users.authenticate(body.username, body.password)
+    if not user:
+        time.sleep(0.8)
+        logger.warning("登录失败", extra={"event": "login_failed"})
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
     response = JSONResponse({"ok": True})
-    auth.attach_cookie(response)
+    auth.attach_cookie(response, users.create_session(user.id))
+    logger.info("用户登录", extra={"event": "login_succeeded", "fields": {"user_id": user.id}})
     return response
 
 
+@app.get("/api/me")
+def current_user(request: Request):
+    return asdict(request.state.user)
+
+
 @app.post("/api/logout")
-def do_logout():
+def do_logout(request: Request):
+    users.revoke_session(request.cookies.get(config.COOKIE_NAME, ""))
     response = JSONResponse({"ok": True})
     auth.clear_cookie(response)
     return response

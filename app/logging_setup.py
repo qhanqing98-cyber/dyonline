@@ -28,11 +28,11 @@ def redact(value):
     text = str(value)
     from app import config
     secrets = set()
-    for key in ("ACCESS_TOKEN", "DOUYIN_COOKIE", "BILI_COOKIE"):
+    for key in ("ACCESS_TOKEN", "ADMIN_PASSWORD", "DOUYIN_COOKIE", "BILI_COOKIE"):
         secret = getattr(config, key, "")
         if secret:
             secrets.add(secret)
-            if key == "ACCESS_TOKEN":
+            if key in ("ACCESS_TOKEN", "ADMIN_PASSWORD"):
                 secrets.add(hashlib.sha256(secret.encode()).hexdigest())
             else:
                 secrets.update(part.partition("=")[2].strip()
@@ -189,4 +189,5 @@ class RequestLoggingMiddleware:
                     "method": scope["method"], "path": scope["path"], "status_code": effective_status,
                     "duration_ms": round((time.monotonic() - started) * 1000, 2),
                     "completed": completed, "disconnected": disconnected,
+                    "user_id": getattr(scope.get("state", {}).get("user"), "id", None),
                 }})

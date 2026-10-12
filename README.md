@@ -14,9 +14,9 @@
 ### 通用
 - **配置外置**：端口、目录、并发、浏览器引擎全部走环境变量 / `.env`，同一份代码适配本机与服务器
 - **任务持久化**：SQLite 存储任务、进度与日志，服务重启数据不丢；启动时自动把中断的任务标记为失败
-- **并发限流**：`MAX_CONCURRENCY` 控制同时下载数，排队超过 `QUEUE_LIMIT` 返回 `429`；入参有长度与数量上限
+- **并发限流**：`MAX_CONCURRENCY` 控制同时下载数，全局未结束任务超过 `QUEUE_LIMIT`、每用户超过 `USER_QUEUE_LIMIT` 返回 `429`；入参有长度与数量上限
 - **磁盘保护**：剩余空间低于 `MIN_FREE_MB` 时拒绝新任务
-- **访问鉴权（可选）**：设置 `ACCESS_TOKEN` 后所有页面与接口都需登录；文件下载带归属校验，防越权与路径穿越
+- **用户隔离**：独立账号与服务端会话；列表、详情、日志和文件下载按用户归属校验；管理员在服务器创建账号
 - **健康检查**：`/healthz` 返回磁盘容量、排队数与并发配置
 
 ### 抖音（downloader.py）
@@ -35,7 +35,7 @@
 ### Web（app/）
 - FastAPI + Jinja2 页面，提交链接即创建后台任务，实时显示进度条与日志
 - 任务卡片支持日志展开、过滤、文件下载；前端含平台自动识别与 XSS 转义
-- 全部接口受访问口令保护（未启用口令时自动关闭鉴权）
+- 业务接口始终要求账号登录；没有账号时不会自动开放访问
 
 ---
 
@@ -45,7 +45,8 @@
 dyonline/
 ├── app/
 │   ├── __init__.py
-│   ├── auth.py            # 访问鉴权：中间件 + 白名单 + HttpOnly Cookie
+│   ├── auth.py            # 服务端会话校验与当前用户绑定
+│   ├── users.py           # 用户、密码散列、会话与账号管理命令
 │   ├── config.py          # 配置中心：环境变量 > .env > 默认值
 │   ├── main.py            # FastAPI 应用入口、路由、并发控制
 │   └── task_store.py      # 任务仓库：SQLite 持久化（对外接口与方法签名保持稳定）
@@ -106,10 +107,13 @@ cp .env.example .env
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | 监听地址与端口，服务器上改为 `0.0.0.0` |
-| `ACCESS_TOKEN` | 空 | **访问口令**。留空 = 关闭鉴权（仅本机开发）；公网部署**必须设置** |
+| `ADMIN_USERNAME` | `admin` | 初始管理员用户名，仅没有账号时使用 |
+| `ADMIN_PASSWORD` | 空 | 初始管理员密码（8–256 字符）；仅首次生效 |
+| `ACCESS_TOKEN` | 空 | 旧部署兼容：作为初始管理员密码的回退值，不再作为共享登录口令 |
 | `COOKIE_SECURE` | `false` | 走 HTTPS 时设为 `true`；本地 HTTP 下必须为 `false`，否则登录状态无法保持 |
 | `MAX_CONCURRENCY` | `2` | 同时下载的任务数（每个无头浏览器约占 150–300MB 内存） |
-| `QUEUE_LIMIT` | `20` | 排队上限，超出返回 `429` |
+| `QUEUE_LIMIT` | `20` | 全局排队中 + 下载中任务上限，超出返回 `429` |
+| `USER_QUEUE_LIMIT` | `3` | 每用户未结束任务上限（管理员同样受限）；无效或小于 1 回退 3 |
 | `MAX_LINKS_PER_TASK` | `20` | 单个任务的链接数上限 |
 | `MIN_FREE_MB` | `2048` | 磁盘剩余空间低于此值拒绝新任务 |
 | `DOUYIN_ENGINE` | Windows: `msedge`；Linux: `chromium` | 抖音浏览器引擎：`msedge`（本机）/ `chromium`（容器与服务器） |
@@ -183,7 +187,7 @@ uvicorn app.main:app --reload
 
 浏览器访问：<http://127.0.0.1:8000>
 
-- 若 `.env` 中设置了 `ACCESS_TOKEN`，会先跳转登录页，输入口令后进入下载台
+- 未登录时跳转登录页，输入管理员分配的用户名和密码后进入下载台
 - 首页粘贴链接（每行一个），提交后创建后台任务，实时显示进度条、日志与文件下载链接
 - 顶栏「退出」按钮可清除登录状态
 
@@ -195,26 +199,27 @@ uvicorn app.main:app --reload
 
 ```bash
 git clone https://github.com/qhanqing98-cyber/dyonline.git && cd dyonline
-cp .env.example .env     # 填好 ACCESS_TOKEN / MAX_CONCURRENCY，并设置 DOUYIN_ENGINE=chromium
+cp .env.example .env     # 填好 ADMIN_PASSWORD / MAX_CONCURRENCY，并设置 DOUYIN_ENGINE=chromium
 docker compose up -d --build
 ```
 
 访问 `http://服务器地址:8080`，由 Caddy 代理 app:8000；HTTP 入口设置 `COOKIE_SECURE=false`。
 
-> ⚠️ 部署前**务必**设置 `ACCESS_TOKEN`，否则任何人都能使用你的服务器下载。
+> 首次部署设置 `ADMIN_PASSWORD` 或通过账号管理命令创建管理员；未配置账号也不会关闭鉴权。
 
 ---
 
 ## HTTP 接口
 
-除 `/healthz` 外，所有接口在启用鉴权后都需要登录（携带 Cookie）。
+业务接口需要登录（携带服务端会话 Cookie）；登录和探活接口公开。
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | `GET` | `/` | 下载台首页（未登录时 302 跳转登录页） |
 | `GET` | `/login` | 登录页 |
-| `POST` | `/api/login` | 校验口令，成功后下发 HttpOnly Cookie |
-| `POST` | `/api/logout` | 退出登录，清除 Cookie |
+| `POST` | `/api/login` | 校验用户名与密码，成功后下发随机 HttpOnly 会话 Cookie |
+| `POST` | `/api/logout` | 退出登录，撤销服务端会话并清除 Cookie |
+| `GET` | `/api/me` | 当前用户信息（不含密码或会话凭证） |
 | `POST` | `/api/tasks` | 创建下载任务，请求体 `{"links": ["链接1", "链接2"]}` |
 | `GET` | `/api/tasks` | 列出所有任务 |
 | `GET` | `/api/tasks/{task_id}` | 查询单个任务的进度、日志、产出文件 |
@@ -248,7 +253,7 @@ docker compose up -d --build
 ## 注意事项
 
 - 本工具仅供个人学习、研究及备份自己拥有权限的内容使用，请遵守目标平台的服务条款与当地法律法规，勿用于任何商业或侵权用途。
-- **公网部署必须设置 `ACCESS_TOKEN`**，否则等同于把服务器对外开放。
+- 首次创建管理员后，为使用者创建独立账号；不要共享管理员账号。
 - 抖音下载依赖浏览器：本机需要系统 Edge；容器/服务器上用 `chromium`（镜像内已装）。
 - B 站 1080P 高清下载需登录 Cookie（`SESSDATA` 等）且本机已安装 ffmpeg。
 - 下载的文件统一保存在 `downloads/` 目录（或 `-o` 指定的目录），同名文件会自动跳过。
@@ -371,7 +376,7 @@ Web 入口当前没有启用 `cookies_browser`，所以不会自动通过本机�
   本机走系统 Edge 的成功率最高；服务器上建议只对外开放 B 站功能（详见 `DEPLOY.md`）。
 - **必须单 worker 运行**：任务队列与并发计数是进程私有的，`uvicorn --workers N` 会导致队列分叉；
   要提升吞吐请调大 `MAX_CONCURRENCY`。
-- **访问鉴权是单共享口令**，不是多用户账号体系：所有使用者共用同一口令、看到同一批任务。
+- **独立账号与任务隔离**：管理员创建账号；不开放注册。管理员的任务接口也只显示自己任务。每用户未结束任务默认最多 3 个，存储额度和公平调度暂未实现。
 
 
 ## 运维日志
@@ -384,3 +389,46 @@ Caddy 访问日志已开启；两种容器均按每个文件 10MB、最多 3 个
 ```bash
 docker compose logs --no-log-prefix --since 30m --tail 200 -f app
 ```
+
+
+### 用户账号与隔离
+
+服务器管理员使用命令创建、列出账号或重置密码，密码交互输入，不写入命令行历史：
+
+```bash
+docker compose exec app python -m app.users create alice
+docker compose exec app python -m app.users list
+docker compose exec app python -m app.users reset-password alice
+```
+
+没有任何账号时，用 `create admin --admin` 创建首个管理员。重置密码会撤销该用户全部会话。
+新任务的文件位于 `downloads/用户ID/任务ID/`；旧任务自动归给初始管理员，旧文件仍从顶层读取。
+完整升级、备份与功能说明见 [部署说明](DEPLOY.md#十用户账号与隔离第一版)。
+
+
+账号隔离的数据流：
+
+```mermaid
+flowchart LR
+    用户名与密码 --> authenticate[authenticate 校验密码]
+    authenticate --> create_session[create_session 生成随机会话]
+    create_session --> Cookie
+    Cookie --> resolve_session[resolve_session 查找用户]
+    resolve_session --> request[request.state.user]
+    request --> owner[任务查询加入 user_id 条件]
+    owner --> 文件[用户ID/任务ID/文件]
+```
+
+- `hash_password()`：用随机盐值和重复计算生成密码散列，数据库不保存明文密码。
+- `authenticate()`：校验登录信息，返回用户对象；`create_session()` 把随机凭证绑定该用户。
+- `AuthMiddleware.__call__()`：每次业务请求读取会话，再把用户放入 `request.state.user`。
+- `TaskStore.get(..., user_id=...)` 和 `all(user_id=...)`：在 SQL 查询阶段限制归属，未找到统一返回 404。
+- `task_directory()`：由服务端用户 ID 与任务 ID 构建目录；旧任务保留原位置。
+- `revoke_session()`：删除当前会话；`reset_password()` 更换密码并撤销该用户全部会话。
+
+语法中，`?` 是 SQLite 参数占位符，具体值通过单独的元组传入，避免把输入拼进 SQL。
+`with self.lock, self.conn:` 同时串行化访问并管理事务，成功提交、异常回滚。
+`@dataclass(frozen=True)` 定义不可随意修改的用户对象；`--admin` 是账号命令的管理员标记。
+
+为何每次请求都查归属？登录只能证明身份，任务归属检查才决定这次访问是否允许。
+后续可根据是否需要自助管理账号，再决定增加管理页面；存储额度和公平调度仍可后续单独决定。

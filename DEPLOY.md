@@ -42,9 +42,10 @@ nano .env
 **必改项**：
 
 ```dotenv
-# 访问口令：不设置的话任何人都能用你的服务器下载！
+# 初始管理员密码：8–256 字符；仅没有任何账号时生效
 # 生成：python3 -c "import secrets;print(secrets.token_urlsafe(32))"
-ACCESS_TOKEN=这里填生成的长口令
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=这里填生成的长密码
 
 # 服务器上没有 Edge，必须用 chromium
 DOUYIN_ENGINE=chromium
@@ -52,6 +53,7 @@ DOUYIN_ENGINE=chromium
 # 并发与内存：2G 内存建议 1~2
 MAX_CONCURRENCY=2
 QUEUE_LIMIT=20
+USER_QUEUE_LIMIT=3
 
 # 当前入口为 HTTP；若前置代理提供 HTTPS，再按访问方式调整
 COOKIE_SECURE=false
@@ -76,7 +78,7 @@ docker compose logs -f app   # 看启动日志（Ctrl+C 退出，不影响服务
 
 ### 6. 验证
 
-浏览器打开 `http://服务器地址:8080` → 应跳转到登录页 → 输入 `ACCESS_TOKEN` → 进入下载台。
+浏览器打开 `http://服务器地址:8080` → 应跳转到登录页 → 输入管理员用户名和密码 → 进入下载台。
 
 命令行快速验证：
 
@@ -149,7 +151,7 @@ docker compose up -d --build
 
 3. **单 worker 限制。** 不能靠 `--workers` 提吞吐（任务队列是进程私有的），只能调 `MAX_CONCURRENCY`。
 
-4. **单共享口令**，不是多用户账号体系。所有使用者共用同一个口令、看到同一批任务。
+4. **账号与任务按用户隔离**，管理员通过服务器命令创建账号；不提供注册；每用户未结束任务默认最多 3 个。
 
 ---
 
@@ -173,7 +175,7 @@ docker compose ps
 
 # 4. 验证
 curl http://127.0.0.1:8000/healthz
-# 浏览器打开 http://127.0.0.1:8000 → 登录页 → 输入 ACCESS_TOKEN
+# 浏览器打开 http://127.0.0.1:8000 → 登录页 → 输入管理员用户名和密码
 
 # 5. 收工（数据保留在 ./data 和 ./downloads）
 docker compose down
@@ -183,7 +185,7 @@ docker compose down
 
 ## 八、安全清单（上线前逐项确认）
 
-- [ ] `ACCESS_TOKEN` 已设置为足够长的随机串（**不做这步 = 把服务器送给别人**）
+- [ ] 首次设置 `ADMIN_PASSWORD`，或通过账号管理命令创建管理员；使用者各有独立账号
 - [ ] HTTP 8080 使用 `COOKIE_SECURE=false`；如通过 HTTPS 网关访问再调整
 - [ ] 安全组放行 22 / 8080，8000 不对公网开放
 - [ ] `.env` 没有被提交进 Git（已在 `.gitignore` 中）
@@ -246,5 +248,78 @@ SQLite 任务日志存于 data 卷，与 Docker 运维日志采用不同的保�
 docker compose up -d --build
 ```
 
-本次无需数据库迁移。已有历史任务日志不会批量改写；历史记录中若曾出现敏感值，
+日志功能不改写历史任务消息。账号隔离的自动结构迁移见下一节；历史记录中若曾出现敏感值，
 需另行处理，不能认为新增脱敏机制已清理过去写入的数据。
+
+
+## 十、用户账号与隔离（第一版）
+
+账号登录始终启用，不再支持空口令关闭鉴权。首次启动没有账号时，以
+`ADMIN_USERNAME=admin` 和 `ADMIN_PASSWORD` 创建管理员；旧部署没有配置
+`ADMIN_PASSWORD` 时使用 `ACCESS_TOKEN` 的值作为初始密码。旧 Cookie 自动失效，需重新登录。
+密码须为 8–256 字符，用户名须为 3–32 位字母、数字、点、下划线或连字符。
+以后修改环境变量不会覆盖已有密码，请使用下面的重置命令。
+
+升级前停止下载并备份数据库与文件，再重新构建：
+
+```bash
+docker compose stop app
+# 复制整个 data 目录，包含可能存在的 SQLite WAL 文件
+cp -a data "data-backup-$(date +%Y%m%d-%H%M%S)"
+cp -a downloads "downloads-backup-$(date +%Y%m%d-%H%M%S)"
+docker compose up -d --build
+```
+
+数据库自动增加 users、sessions 表及任务 user_id、storage_layout 列。
+无归属的旧任务分配给第一个管理员；没有管理员时保持隐藏，创建管理员并重启 app 后分配。
+旧媒体文件保持在顶层，不批量移动；新下载使用 `downloads/用户ID/任务ID/`，清理程序同时处理两种布局。
+迁移可重复执行；后续回滚须使用备份并与对应版本一起恢复，避免混用两种目录布局。
+
+账号由有服务器权限的管理员管理，没有开放注册或网页用户管理页：
+
+```bash
+# 未设置初始管理员密码时，交互创建首个管理员
+# 密码不会显示，也不会放进命令行参数或 shell 历史
+docker compose exec app python -m app.users create admin --admin
+# 如果是运行后通过命令创建首个管理员，重启以分配旧任务
+docker compose restart app
+
+# 创建普通账号、查看账号、重置密码
+docker compose exec app python -m app.users create alice
+docker compose exec app python -m app.users list
+docker compose exec app python -m app.users reset-password alice
+```
+
+本机可将上述容器命令替换为 `.venv/Scripts/python -m app.users ...`。
+重置密码撤销该账号所有会话；退出只撤销当前会话。服务重启后，未过期会话仍可用。
+浏览器 Cookie 存随机会话凭证，数据库只存其散列；密码使用独立盐值的 PBKDF2-SHA256（600000 次）。
+
+所有任务列表、详情、日志和文件接口只读取当前登录用户的数据，包括管理员。
+别人任务与不存在任务统一返回 404，不能靠修改任务 ID 读取别人文件。
+用户 ID 由服务端会话获取，前端提交的 user_id 不参与归属判断。
+运维日志增加 user_id；平台 Cookie 仍由服务端统一配置，第一版不支持个人平台 Cookie。
+全局队列和磁盘保护继续生效；每用户任务数限制见下节，存储额度和公平调度尚未实现。
+
+验收时用两个浏览器会话登录不同账号，各提交一个任务，然后交换任务与下载地址；
+双方都应得到 404，各自列表只显示自己的任务。退出后重用旧 Cookie 应返回 401。
+
+
+## 十一、每用户任务上限
+
+`USER_QUEUE_LIMIT=3` 限制每个账号的“排队中 + 下载中”任务总数，管理员也受限。
+超过上限返回 429，页面提示当前数量和上限；其他账号仍可在全局名额范围内提交。
+`QUEUE_LIMIT` 仍是所有账号的未结束任务总上限。每个任务的链接数量仍由 `MAX_LINKS_PER_TASK` 限制。
+无效或小于 1 的 `USER_QUEUE_LIMIT` 回退默认值 3；改变配置后需重新创建 app 容器。
+
+检查用户数量、检查全局数量及预占名额在同一把锁内完成，防止并发提交突破上限。
+下载成功、失败、磁盘拒绝都会释放名额；数据库创建或线程池提交失败也会回滚名额。
+服务重启后原未结束任务已按原规则标记为失败，因此计数从零开始。
+该计数依赖单进程，继续保持 `uvicorn --workers 1`。
+
+拒绝日志事件为 `user_queue_rejected`，含 `user_id`、`user_pending`、`user_queue_limit`，
+可按用户 ID 查询。没有新增数据库列，也没有改变线程池先进先出的调度方式。
+
+```dotenv
+USER_QUEUE_LIMIT=3
+QUEUE_LIMIT=20
+```

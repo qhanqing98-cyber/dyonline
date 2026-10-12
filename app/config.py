@@ -79,12 +79,17 @@ DB_PATH = Path(_str("DB_PATH", str(DATA_DIR / "app.db"))).resolve()
 # 并发与队列（公网部署时这是保命的两个值）
 # ---------------------------------------------------------------------------
 MAX_CONCURRENCY = _int("MAX_CONCURRENCY", 2)   # 同时下载数；每个浏览器约 150-300MB 内存
-QUEUE_LIMIT = _int("QUEUE_LIMIT", 20)          # 排队上限，超出直接回 429
+QUEUE_LIMIT = _int("QUEUE_LIMIT", 20)          # 全局未结束任务上限
+USER_QUEUE_LIMIT = _int("USER_QUEUE_LIMIT", 3)  # 每用户排队中 + 下载中任务上限
+if USER_QUEUE_LIMIT < 1:
+    USER_QUEUE_LIMIT = 3
 
 # ---------------------------------------------------------------------------
-# 访问鉴权（ACCESS_TOKEN 留空 = 关闭鉴权，本机开发用）
+# 用户登录（始终启用；ACCESS_TOKEN 仅用于迁移初始管理员）
 # ---------------------------------------------------------------------------
 ACCESS_TOKEN = _str("ACCESS_TOKEN", "")
+ADMIN_USERNAME = _str("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = _str("ADMIN_PASSWORD", ACCESS_TOKEN)
 COOKIE_NAME = _str("COOKIE_NAME", "dy_token")
 COOKIE_MAX_AGE = _int("COOKIE_MAX_AGE", 60 * 60 * 24 * 30)   # 登录保持 30 天
 COOKIE_SECURE = _bool("COOKIE_SECURE", False)                # HTTPS 部署时设 true
@@ -113,12 +118,9 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def summary() -> str:
-    """启动日志用：打印生效配置，敏感值只显示长度不打码原文。"""
-
-    def mask(value: str) -> str:
-        return "未设置" if not value else f"已设置({len(value)}字符)"
+    """启动摘要仅展示非敏感配置。"""
 
     return (
         f"HOST={HOST} PORT={PORT} 并发={MAX_CONCURRENCY} 队列上限={QUEUE_LIMIT} "
-        f"引擎={DOUYIN_ENGINE} 鉴权={mask(ACCESS_TOKEN)} 下载目录={DOWNLOAD_DIR}"
+        f"引擎={DOUYIN_ENGINE} 账号登录=启用 下载目录={DOWNLOAD_DIR}"
     )

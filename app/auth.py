@@ -1,90 +1,48 @@
-# app/auth.py
-"""访问鉴权：单共享口令 + HttpOnly Cookie。
-
-设计要点：
-- 用「中间件」而不是路由依赖实现：一次拦截页面 / API / 静态资源，不会有漏网路由
-- 白名单：登录页、登录接口、静态资源、探活接口（不放行的话登录页自己的 CSS 都会被拦住 → 死锁）
-- Cookie 里存 sha256(口令) 而不是明文：Cookie 泄露 ≠ 口令泄露
-- 校验用 secrets.compare_digest 常数时间比较，避免时序攻击逐位推导口令
-- config.ACCESS_TOKEN 为空 = 完全关闭鉴权（本机开发用）
-"""
-from __future__ import annotations
-
-import hashlib
-from secrets import compare_digest
+"""服务端随机会话鉴权；用户身份只从数据库读取。"""
 from urllib.parse import quote
-
-from fastapi import Request
-from fastapi.responses import JSONResponse, RedirectResponse
-from starlette.middleware.base import BaseHTTPMiddleware
-
+from starlette.requests import Request
+from starlette.responses import JSONResponse, RedirectResponse
 from app import config
+from app.logging_setup import log_context
 
-# 免登录即可访问的路径 / 前缀
-_PUBLIC_PATHS = {"/login", "/api/login", "/api/logout", "/healthz", "/favicon.ico"}
-_PUBLIC_PREFIXES = ("/static/",)
-
-
-def enabled() -> bool:
-    """是否启用了访问鉴权。"""
-    return bool(config.ACCESS_TOKEN)
+_PUBLIC_PATHS = {"/login", "/api/login", "/healthz", "/favicon.ico"}
 
 
-def token_digest(token: str) -> str:
-    """口令 → Cookie 中保存的散列值（绝不下发明文口令）。"""
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+def attach_cookie(response, token):
+    response.set_cookie(config.COOKIE_NAME, token, max_age=config.COOKIE_MAX_AGE,
+                        httponly=True, samesite="lax", secure=config.COOKIE_SECURE, path="/")
 
 
-def check_token(token: str) -> bool:
-    """校验用户提交的口令（常数时间比较）。"""
-    return bool(config.ACCESS_TOKEN) and compare_digest(
-        (token or "").strip(), config.ACCESS_TOKEN
-    )
+def clear_cookie(response):
+    response.delete_cookie(config.COOKIE_NAME, path="/", secure=config.COOKIE_SECURE,
+                           httponly=True, samesite="lax")
 
 
-def verify(request: Request) -> bool:
-    """校验请求携带的 Cookie 是否有效。"""
-    if not enabled():
-        return True
-    got = request.cookies.get(config.COOKIE_NAME, "")
-    return bool(got) and compare_digest(got, token_digest(config.ACCESS_TOKEN))
+class AuthMiddleware:
+    def __init__(self, app, users):
+        self.app, self.users = app, users
 
-
-def _is_public(path: str) -> bool:
-    return path in _PUBLIC_PATHS or path.startswith(_PUBLIC_PREFIXES)
-
-
-def attach_cookie(response) -> None:
-    """登录成功后下发 Cookie。"""
-    response.set_cookie(
-        key=config.COOKIE_NAME,
-        value=token_digest(config.ACCESS_TOKEN),
-        max_age=config.COOKIE_MAX_AGE,
-        httponly=True,                # JS 读不到 → XSS 偷不走
-        samesite="lax",               # 跨站请求不带 → 挡住大部分 CSRF
-        secure=config.COOKIE_SECURE,  # HTTPS 部署时置 true
-        path="/",
-    )
-
-
-def clear_cookie(response) -> None:
-    """退出登录：清除 Cookie。"""
-    response.delete_cookie(config.COOKIE_NAME, path="/")
-
-
-class AuthMiddleware(BaseHTTPMiddleware):
-    """统一拦截未登录请求：API 回 401 JSON，页面 302 跳登录页。"""
-
-    async def dispatch(self, request: Request, call_next):
-        if _is_public(request.url.path) or verify(request):
-            return await call_next(request)
-
-        # API 请求：交给前端处理（前端会跳转登录页）
-        if request.url.path.startswith("/api/"):
-            return JSONResponse({"detail": "未登录或登录已失效"}, status_code=401)
-
-        # 页面请求：记住原地址，登录后跳回去
-        target = request.url.path
-        if request.url.query:
-            target = f"{target}?{request.url.query}"
-        return RedirectResponse(f"/login?next={quote(target, safe='')}", status_code=302)
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        request = Request(scope)
+        path = scope["path"]
+        # 同源 Cookie 认证的写操作拒绝显式跨站来源。
+        origin = request.headers.get("origin")
+        if scope["method"] not in ("GET", "HEAD", "OPTIONS") and (
+            request.headers.get("sec-fetch-site") == "cross-site" or
+            (origin and origin != str(request.base_url).rstrip("/"))
+        ):
+            return await JSONResponse({"detail": "不允许跨站操作"}, status_code=403)(scope, receive, send)
+        if path in _PUBLIC_PATHS or path.startswith("/static/"):
+            return await self.app(scope, receive, send)
+        user = self.users.resolve_session(request.cookies.get(config.COOKIE_NAME, ""))
+        if user:
+            scope.setdefault("state", {})["user"] = user
+            with log_context(user_id=user.id):
+                return await self.app(scope, receive, send)
+        if path.startswith("/api/"):
+            response = JSONResponse({"detail": "未登录或登录已失效"}, status_code=401)
+        else:
+            response = RedirectResponse("/login?next=" + quote(path, safe=""), status_code=302)
+        await response(scope, receive, send)

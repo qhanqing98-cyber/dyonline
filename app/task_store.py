@@ -1,8 +1,7 @@
 # app/task_store.py
 """下载任务仓库：SQLite 持久化版。
 
-对外 5 个方法签名与旧内存版完全一致（create/get/all/update/append_log/add_file），
-app/main.py 无需感知存储从 dict 换成了 SQLite。
+任务增加用户归属；对外读取传 user_id，内部下载线程可按任务 ID 更新。
 数据落在 data/app.db（路径见 app/config.py 的 DB_PATH），服务重启后任务、进度、日志全部还在。
 
 注意：必须以单 worker 运行（uvicorn --workers 1）。
@@ -44,6 +43,10 @@ class DownloadTask:
 
     # 用户提交的视频链接列表
     links: list[str]
+
+    # 归属由服务端绑定，旧任务保留 legacy 顶层文件布局
+    user_id: str | None = None
+    storage_layout: str = "legacy"
 
     # 任务状态：queued 排队中，running 运行中，done 完成，failed 失败
     status: str = "queued"
@@ -103,7 +106,7 @@ class TaskStore:
     );
     """
 
-    def __init__(self, db_path=None):
+    def __init__(self, db_path=None, legacy_user_id=None):
         self.path = Path(db_path or config.DB_PATH)
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -111,6 +114,15 @@ class TaskStore:
         self.conn = connect(str(self.path), check_same_thread=False)
         self.conn.row_factory = Row
         self.conn.executescript(self._SCHEMA)
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(tasks)")}
+        if "user_id" not in columns:
+            self.conn.execute("ALTER TABLE tasks ADD COLUMN user_id TEXT")
+        if "storage_layout" not in columns:
+            self.conn.execute("ALTER TABLE tasks ADD COLUMN storage_layout TEXT NOT NULL DEFAULT 'legacy'")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS tasks_owner ON tasks(user_id, created_at)")
+        if legacy_user_id:
+            self.conn.execute("UPDATE tasks SET user_id=? WHERE user_id IS NULL", (legacy_user_id,))
+        self.conn.commit()
         self.conn.execute("PRAGMA journal_mode=WAL").fetchone()
         self.conn.commit()
 
@@ -132,6 +144,7 @@ class TaskStore:
         ).fetchall()
         return DownloadTask(
             id=row["id"],
+            user_id=row["user_id"], storage_layout=row["storage_layout"],
             links=loads(row["links"]),
             status=row["status"],
             progress=row["progress"],
@@ -159,34 +172,37 @@ class TaskStore:
             logging.getLogger(__name__).warning("恢复中断任务", extra={"event": "tasks_interrupted", "fields": {"count": cur.rowcount}})
 
     # ------------------------------------------------------------------
-    # 对外接口（签名与旧内存版完全一致，main.py 无需改动）
+    # 对外接口：用户请求传 user_id 限定归属，后台线程按 task_id 更新
     # ------------------------------------------------------------------
-    def create(self, links: list[str]) -> DownloadTask:
+    def create(self, links: list[str], user_id=None) -> DownloadTask:
         # uuid4 用来生成随机任务 id
-        task = DownloadTask(id=uuid4().hex, links=list(links))
+        task = DownloadTask(id=uuid4().hex, links=list(links), user_id=user_id,
+                            storage_layout="isolated" if user_id else "legacy")
         now = _now()
 
         with self.lock:
             self.conn.execute(
                 "INSERT INTO tasks"
-                " (id, links, status, progress, phase, files, error, created_at, updated_at)"
-                " VALUES (?, ?, 'queued', 0, 'queued', '[]', NULL, ?, ?)",
-                (task.id, dumps(task.links, ensure_ascii=False), now, now),
+                " (id, links, status, progress, phase, files, error, created_at, updated_at, user_id, storage_layout)"
+                " VALUES (?, ?, 'queued', 0, 'queued', '[]', NULL, ?, ?, ?, ?)",
+                (task.id, dumps(task.links, ensure_ascii=False), now, now, user_id, task.storage_layout),
             )
             self.conn.commit()
         return task
 
-    def get(self, task_id: str) -> DownloadTask | None:
+    def get(self, task_id: str, user_id=None) -> DownloadTask | None:
         with self.lock:
             row = self.conn.execute(
-                "SELECT * FROM tasks WHERE id=?", (task_id,)
+                "SELECT * FROM tasks WHERE id=?" + (" AND user_id=?" if user_id is not None else ""),
+                (task_id, user_id) if user_id is not None else (task_id,)
             ).fetchone()
             return self._row_to_task(row) if row else None
 
-    def all(self) -> list[DownloadTask]:
+    def all(self, user_id=None) -> list[DownloadTask]:
         with self.lock:
             rows = self.conn.execute(
-                "SELECT * FROM tasks ORDER BY created_at DESC"
+                "SELECT * FROM tasks" + (" WHERE user_id=?" if user_id is not None else "") + " ORDER BY created_at DESC",
+                (user_id,) if user_id is not None else ()
             ).fetchall()
             return [self._row_to_task(r) for r in rows]
 
@@ -274,12 +290,13 @@ class TaskStore:
         if not removed:
             return
         with self.lock:
-            rows = self.conn.execute("SELECT id, files FROM tasks").fetchall()
+            rows = self.conn.execute("SELECT id, user_id, storage_layout, files FROM tasks").fetchall()
             for row in rows:
                 files = loads(row["files"])
+                prefix = f"{row['user_id']}/{row['id']}/" if row["storage_layout"] == "isolated" else ""
                 remaining = [name for name in files
-                             if (unquote(name.rsplit("/", 1)[-1])
-                                 if name.startswith("/files/") else name) not in removed]
+                             if prefix + (unquote(name.rsplit("/", 1)[-1])
+                                          if name.startswith("/files/") else name) not in removed]
                 if remaining != files:
                     self.conn.execute(
                         "UPDATE tasks SET files=?, updated_at=? WHERE id=?",
