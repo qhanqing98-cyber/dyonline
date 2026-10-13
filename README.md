@@ -1,483 +1,318 @@
-# 个人视频下载工具
+# DY·ONLINE
 
-支持 **抖音** 与 **B 站（bilibili）** 无水印视频下载，提供命令行（CLI）与 Web 两种使用方式。
-既能在本机跑，也能用 Docker 部署到服务器对外提供服务（见 [DEPLOY.md](DEPLOY.md)）。
+抖音与 B 站视频下载工具，提供命令行和 Web 两种入口。Web 支持独立账号、任务隔离、SQLite 持久化、任务数量限制、媒体定期清理和 JSON 运维日志。
 
-- **抖音**：Playwright 驱动浏览器（本机用系统 Edge，容器/服务器用 Chromium）读取作品详情接口响应，获取可用的无水印直链；成功与否取决于平台访问限制。
-- **B 站**：纯 `requests` + wbi 签名，无需浏览器，支持多分 P 与 1080P 高清（需登录态 + ffmpeg）。
-- **Web**：FastAPI 服务，含访问鉴权、任务持久化（SQLite）、并发限流与受控文件下载。
+抖音通过 Playwright 浏览器获取作品详情；B 站通过 `requests` 与 wbi 签名获取播放地址。平台登录、验证码和网络限制可能导致下载失败，不保证所有链接均可下载。
 
----
+## 快速开始
 
-## 功能特性
+### Windows 本机运行
 
-### 通用
-- **配置外置**：端口、目录、并发、浏览器引擎全部走环境变量 / `.env`，同一份代码适配本机与服务器
-- **任务持久化**：SQLite 存储任务、进度与日志，服务重启数据不丢；启动时自动把中断的任务标记为失败
-- **并发限流**：`MAX_CONCURRENCY` 控制同时下载数，全局或每用户未结束任务达到 `QUEUE_LIMIT` / `USER_QUEUE_LIMIT` 后，继续提交返回 `429`；入参有长度与数量上限
-- **磁盘保护**：剩余空间低于 `MIN_FREE_MB` 时拒绝新任务
-- **用户隔离**：独立账号与服务端会话；列表、详情、日志和文件下载按用户归属校验；管理员在服务器创建账号
-- **健康检查**：`/healthz` 返回磁盘容量、排队数与并发配置
+需要 Python 3.10+。下载抖音视频时，默认使用已安装的 Microsoft Edge。
 
-### 抖音（downloader.py）
-- 无水印视频下载（只取 `play_addr` 系，避开带 `watermark=1` 的 `download_addr`）
-- 支持多种输入：分享链接、口令文本、纯视频 ID（15~20 位数字）
-- 短链（`v.douyin.com`）自动跳转解析
-- 浏览器引擎可切换：`msedge`（本机首选，反爬识别率低）/ `chromium`（容器与服务器默认选项）
-- 失败时可用 **yt-dlp** 兜底，支持从浏览器读取 cookie（`edge` / `chrome`）
+在项目目录执行 PowerShell 命令：
 
-### B 站（bilibili.py）
-- 解析 BV 号 / av 号 / `b23.tv` 短链 / 完整链接
-- 获取标题、UP 主、分 P 列表，支持按页码下载指定分 P 或全部
-- 默认下载 ≤720P 的 mp4 直链（单文件，无需 ffmpeg）
-- `--hd` 下载 1080P（DASH 音视频分离，ffmpeg 合并，需登录 cookie + ffmpeg）
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Copy-Item .env.example .env
 
-### Web（app/）
-- FastAPI + Jinja2 页面，提交链接即创建后台任务，实时显示进度条与日志
-- 任务卡片支持日志展开、过滤、文件下载；前端含平台自动识别与 XSS 转义
-- 业务接口始终要求账号登录；没有账号时不会自动开放访问
+# 创建首个管理员；按提示输入两次密码
+.\.venv\Scripts\python.exe -m app.users create admin --admin
 
----
-
-## 目录结构
-
-```
-dyonline/
-├── app/
-│   ├── __init__.py
-│   ├── auth.py            # 服务端会话校验与当前用户绑定
-│   ├── users.py           # 用户、密码散列、会话与账号管理命令
-│   ├── config.py          # 配置中心：环境变量 > .env > 默认值
-│   ├── main.py            # FastAPI 应用入口、路由、并发控制
-│   ├── cleanup.py         # 定期清理媒体文件、保护下载与文件传输
-│   ├── logging_setup.py   # JSON 日志、脱敏、请求与任务上下文
-│   └── task_store.py      # SQLite 任务、日志、文件与归属查询
-├── static/
-│   ├── app.js             # 前端逻辑（提交 / 轮询 / 渲染 / 通知）
-│   └── style.css          # 前端样式
-├── templates/
-│   ├── index.html         # 下载台首页
-│   └── login.html         # 用户名与密码登录页
-├── data/                  # 运行期数据（SQLite 库，自动创建，不入库）
-├── downloads/             # 新任务按 用户ID/任务ID 保存；旧文件保留顶层（不入库）
-├── bilibili.py            # B 站下载模块
-├── downloader.py          # 抖音下载模块 + CLI 入口
-├── requirements.txt       # Python 依赖清单
-├── .env.example           # 配置模板（复制成 .env 使用）
-├── Dockerfile             # 生产镜像定义
-├── docker-compose.yml     # 一键部署编排（应用 + Caddy + 数据卷）
-├── Caddyfile              # 8080 → app:8000 反向代理
-├── DEPLOY.md              # 部署指南（含排障与安全清单）
-└── README.md
+# 启动服务
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
----
+浏览器访问 <http://127.0.0.1:8000>，用刚创建的用户名和密码登录。粘贴视频链接，每行一个，提交后可查看任务进度、日志和文件下载链接。
 
-## 环境要求
+完成配置和账号创建后，也可以双击 `start.bat`，由脚本安装依赖并启动网站。首次运行没有账号时，网站仍要求登录，不会自动开放访问。
 
-- **Python** 3.10+
-- **浏览器**：Windows 默认 Edge；Linux 容器默认 Playwright Chromium。使用 `DOUYIN_ENGINE` 配置；兼容变量 `DOUYIN_BROWSER_CHANNEL` 优先于它。
-- **ffmpeg**（仅 B 站 1080P 高清下载需要，需加入系统 PATH）
-- **Docker**（可选）：服务器容器部署使用。
-
----
-
-## 安装
+Linux 本机使用虚拟环境中的 Python 执行相同模块；抖音浏览器设为 `DOUYIN_ENGINE=chromium`，并安装浏览器依赖：
 
 ```bash
-# 1.（推荐）创建并激活虚拟环境
-python -m venv .venv
-.venv\Scripts\activate        # Windows
-
-# 2. 安装依赖
-pip install -r requirements.txt
-
-# 3. Windows 使用已安装的系统 Edge 时，无需下载 Chromium
-# Linux 本机使用 Chromium 时安装浏览器及系统依赖
 python -m playwright install --with-deps chromium
 ```
 
----
+### Docker 服务器部署
 
-## 配置
-
-复制配置模板后按需修改（`.env` 已被 gitignore 忽略，不会进仓库）：
+在服务器项目目录执行：
 
 ```bash
-cp .env.example .env         # PowerShell 可用 Copy-Item .env.example .env
+cp .env.example .env
+# 编辑 .env，设置 ADMIN_PASSWORD，并将 DOUYIN_ENGINE 改为 chromium
+
+docker compose up -d --build
+docker compose ps
 ```
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `HOST` / `PORT` | `127.0.0.1` / `8000` | 监听地址与端口，服务器上改为 `0.0.0.0` |
-| `ADMIN_USERNAME` | `admin` | 初始管理员用户名，仅没有账号时使用 |
-| `ADMIN_PASSWORD` | 空 | 初始管理员密码（8–256 字符）；仅首次生效 |
-| `ACCESS_TOKEN` | 空 | 旧部署兼容：作为初始管理员密码的回退值，不再作为共享登录口令 |
-| `COOKIE_MAX_AGE` | `2592000` | 会话有效期（秒），默认 30 天 |
-| `LOG_LEVEL` | `INFO` | JSON 日志级别；无效值回退 INFO |
-| `COOKIE_SECURE` | `false` | 走 HTTPS 时设为 `true`；本地 HTTP 下必须为 `false`，否则登录状态无法保持 |
-| `MAX_CONCURRENCY` | `2` | 同时下载的任务数（每个无头浏览器约占 150–300MB 内存） |
-| `QUEUE_LIMIT` | `20` | 全局排队中 + 下载中任务上限，超出返回 `429` |
-| `USER_QUEUE_LIMIT` | `3` | 每用户未结束任务上限（管理员同样受限）；无效或小于 1 回退 3 |
-| `MAX_LINKS_PER_TASK` | `20` | 单个任务的链接数上限 |
-| `MIN_FREE_MB` | `2048` | 磁盘剩余空间低于此值拒绝新任务 |
-| `DOUYIN_ENGINE` | Windows: `msedge`；Linux: `chromium` | 抖音浏览器引擎：`msedge`（本机）/ `chromium`（容器与服务器） |
-| `DOUYIN_COOKIE` | 空 | 注入抖音登录态（容器/服务器上无法用 `--cookies-from-browser`） |
-| `BILI_COOKIE` | 空 | B 站登录态（`SESSDATA=xxx`），下载 1080P 需要 |
-| `DOWNLOAD_DIR` / `DATA_DIR` / `DB_PATH` | `downloads/` / `data/` / `data/app.db` | 文件、运行数据和 SQLite 数据库路径 |
-| `DOWNLOAD_RETENTION_HOURS` | `24` | 媒体保留小时数；0 关闭清理 |
-| `DOWNLOAD_CLEANUP_INTERVAL_SECONDS` | `3600` | 定期清理检查间隔（秒） |
+初始配置示例：
 
-配置优先级：**真实环境变量 > 项目根目录 `.env` > 代码内默认值**。
-
----
-
-## 使用方法
-
-### 方式一：命令行（CLI）
-
-```bash
-python downloader.py "分享链接或口令"
+```dotenv
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=替换为你的初始管理员密码
+DOUYIN_ENGINE=chromium
+COOKIE_SECURE=false
+MAX_CONCURRENCY=2
+QUEUE_LIMIT=20
+USER_QUEUE_LIMIT=3
 ```
 
-支持一次传入多个链接（自动区分抖音与 B 站）：
+没有任何账号时，首次启动会用上述配置创建管理员。访问 `http://服务器地址:8080`，输入管理员用户名和密码。
 
-```bash
-python downloader.py -o D:/downloads "链接1" "链接2" ...
+```mermaid
+flowchart LR
+    浏览器[浏览器 :8080] --> Caddy[Caddy :8080]
+    Caddy --> app[app 容器 :8000]
+    app --> SQLite[SQLite 数据库]
+    app --> 文件[下载文件]
 ```
 
-**抖音相关参数：**
+Caddy 对外监听 8080，代理 `app:8000`。app 的 8000 只映射到宿主机回环地址，不对公网开放。当前入口为 HTTP；通过 HTTPS 访问时再设置 `COOKIE_SECURE=true`。
 
-```bash
-# 失败时用 yt-dlp 从 Edge 读取 cookie 兜底
-python downloader.py --cookies-from-browser edge "链接"
+完整安装、备份、升级及排障步骤见 [部署说明](DEPLOY.md)。
 
-# 强制使用 yt-dlp 下载
-python downloader.py --yt-dlp --cookies-from-browser edge "链接"
+## 账号由谁创建
 
-# 指定浏览器引擎（容器/服务器上用 chromium）
-python downloader.py --engine chromium "链接"
-```
+目前不开放注册，也没有网页账号管理入口。**有服务器操作权限的管理员使用命令创建账号**，再把网站地址、用户名和密码交给使用者。仅在网站登录 admin，不能创建其他账号。
 
-**B 站相关参数：**
-
-```bash
-# 下载指定分 P（页码，从 1 开始）或 ALL（全部）
-python downloader.py --p 2 "BV1xxxx"
-
-# 下载 1080P 高清（需登录 cookie + 本机安装 ffmpeg）
-python downloader.py --hd --cookie "SESSDATA=xxx" "BV1xxxx"
-```
-
-完整参数列表：
-
-| 参数 | 说明 |
-|------|------|
-| `links` | 分享链接/口令，可一次给多个 |
-| `-o, --output` | 保存目录（默认当前目录） |
-| `--cookies-from-browser` | 抖音失败时用 yt-dlp 从浏览器读 cookie 兜底（如 `edge`/`chrome`） |
-| `--yt-dlp` | 抖音强制使用 yt-dlp 下载 |
-| `--engine` | 抖音：浏览器引擎 `msedge` 或 `chromium` |
-| `--p` | B 站：选择分 P（页码数字或 `ALL`，默认全部） |
-| `--hd` | B 站：下载 1080P 高清（DASH + ffmpeg） |
-| `--cookie` | B 站：传登录 Cookie（如 `SESSDATA=xxx`） |
-
-### 方式二：Web 服务
-
-启动前在 `.env` 设置 `ADMIN_PASSWORD`（至少 8 个字符），或先运行 `python -m app.users create admin --admin`。没有账号时仍要求登录。
-
-**一键启动（本机推荐）**：双击根目录 `start.bat`，脚本会自动完成「创建虚拟环境 → 安装依赖 → 启动服务 → 打开浏览器」。
-
-手动启动：
-
-```bash
-uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
-```
-
-浏览器访问：<http://127.0.0.1:8000>
-
-- 未登录时跳转登录页，输入管理员分配的用户名和密码后进入下载台
-- 首页粘贴链接（每行一个），提交后创建后台任务，实时显示进度条、日志与文件下载链接
-- 顶栏「退出」按钮撤销当前服务端会话并清除浏览器 Cookie
-
----
-
-## 用户账号与隔离
-
-服务器管理员使用命令创建、列出账号或重置密码，密码交互输入，不写入命令行历史：
+### 创建普通账号
 
 ```bash
 docker compose exec app python -m app.users create alice
+```
+
+按提示输入两次密码，输入内容不会显示。用户名为 3–32 位字母、数字、点、下划线或连字符；密码为 8–256 个字符。
+
+### 查看账号、重置密码
+
+```bash
 docker compose exec app python -m app.users list
 docker compose exec app python -m app.users reset-password alice
 ```
 
-没有任何账号时，用 `create admin --admin` 创建首个管理员。重置密码会撤销该用户全部会话。
-新任务的文件位于 `downloads/用户ID/任务ID/`；旧任务自动归给初始管理员，旧文件仍从顶层读取。
-完整升级、备份与功能说明见 [部署说明](DEPLOY.md#十用户账号与隔离第一版)。
+重置密码会撤销该用户全部会话，需重新登录。网页“退出”只撤销当前会话。
 
-
-账号隔离的数据流：
-
-```mermaid
-flowchart LR
-    用户名与密码 --> authenticate[authenticate 校验密码]
-    authenticate --> create_session[create_session 生成随机会话]
-    create_session --> Cookie
-    Cookie --> resolve_session[resolve_session 查找用户]
-    resolve_session --> request[request.state.user]
-    request --> owner[任务查询加入 user_id 条件]
-    owner --> 文件[用户ID/任务ID/文件]
-```
-
-- `hash_password()`：用随机盐值和重复计算生成密码散列，数据库不保存明文密码。
-- `authenticate()`：校验登录信息，返回用户对象；`create_session()` 把随机凭证绑定该用户。
-- `AuthMiddleware.__call__()`：每次业务请求读取会话，再把用户放入 `request.state.user`。
-- `TaskStore.get(..., user_id=...)` 和 `all(user_id=...)`：在 SQL 查询阶段限制归属，未找到统一返回 404。
-- `task_directory()`：由服务端用户 ID 与任务 ID 构建目录；旧任务保留原位置。
-- `revoke_session()`：删除当前会话；`reset_password()` 更换密码并撤销该用户全部会话。
-
-语法中，`?` 是 SQLite 参数占位符，具体值通过单独的元组传入，避免把输入拼进 SQL。
-`with self.lock, self.conn:` 同时串行化访问并管理事务，成功提交、异常回滚。
-`@dataclass(frozen=True)` 定义不可随意修改的用户对象；`--admin` 是账号命令的管理员标记。
-
-为何每次请求都查归属？登录只能证明身份，任务归属检查才决定这次访问是否允许。
-后续可根据是否需要自助管理账号，再决定增加管理页面；存储额度和公平调度仍可后续单独决定。
-
-### 每用户任务上限
-
-```dotenv
-USER_QUEUE_LIMIT=3
-QUEUE_LIMIT=20
-```
-
-每个用户最多 3 个排队中或下载中的任务，所有用户合计最多 20 个；管理员也受限。
-达到用户上限后返回 429，页面显示数量与等待提示，日志事件为 `user_queue_rejected`。
-用户名额与全局名额在同一把锁内检查和预占，任务成功、失败、磁盘拒绝或提交异常均释放名额。
-这限制的是任务数，一个任务仍可包含多个链接；存储额度和公平调度尚未实现。
-
-```mermaid
-flowchart LR
-    A[识别当前用户] --> B[检查用户名额]
-    B --> C[检查全局名额]
-    C --> D[预占名额并提交任务]
-    D --> E[任务结束或提交失败]
-    E --> F[释放用户及全局名额]
-```
-
-详情见 [部署说明：每用户任务上限](DEPLOY.md#十一每用户任务上限)。
-
----
-
-## 部署到服务器（Docker）
-
-最简流程（完整步骤见 [DEPLOY.md](DEPLOY.md)）：
+如果首次部署没有配置 `ADMIN_PASSWORD`，可在已运行的容器中创建管理员：
 
 ```bash
-git clone https://github.com/qhanqing98-cyber/dyonline.git && cd dyonline
-cp .env.example .env     # 填好 ADMIN_PASSWORD / MAX_CONCURRENCY，并设置 DOUYIN_ENGINE=chromium
-docker compose up -d --build
+docker compose exec app python -m app.users create admin --admin
+# 分配旧任务需要在创建首个管理员后重启 app
+docker compose restart app
 ```
 
-访问 `http://服务器地址:8080`，由 Caddy 代理 app:8000；HTTP 入口设置 `COOKIE_SECURE=false`。
+本机管理账号时，把 `docker compose exec app python` 替换为虚拟环境中的 Python，例如 `.\.venv\Scripts\python.exe`。
 
-> 首次部署设置 `ADMIN_PASSWORD` 或通过账号管理命令创建管理员；未配置账号也不会关闭鉴权。
+`ADMIN_USERNAME`、`ADMIN_PASSWORD` 只用于首次创建账号，修改它们不会重置已有密码。旧部署未设置 `ADMIN_PASSWORD` 时，会以 `ACCESS_TOKEN` 的值作为初始管理员密码；旧 Cookie 失效，需改用用户名和密码登录。
 
----
+## 用户隔离与任务限制
 
-## HTTP 接口
+每个用户只能查看自己的任务、日志和文件，管理员也遵守相同的任务归属检查。访问他人的任务或文件统一返回 404。
 
-业务接口需要登录（携带服务端会话 Cookie）；登录和探活接口公开。
+用户身份从服务端会话读取，前端传入的 `user_id` 不参与任务归属判断。新文件按以下结构存放，避免不同任务的同名文件覆盖：
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| `GET` | `/` | 下载台首页（未登录时 302 跳转登录页） |
-| `GET` | `/login` | 登录页 |
-| `POST` | `/api/login` | 请求体 `{"username":"alice","password":"..."}`，校验成功后下发 HttpOnly 会话 Cookie |
-| `POST` | `/api/logout` | 退出登录，撤销服务端会话并清除 Cookie |
-| `GET` | `/api/me` | 当前用户信息（不含密码或会话凭证） |
-| `POST` | `/api/tasks` | 创建下载任务，请求体 `{"links": ["链接1", "链接2"]}` |
-| `GET` | `/api/tasks` | 仅列出当前用户的任务（管理员同样遵守归属限制） |
-| `GET` | `/api/tasks/{task_id}` | 查询当前用户任务的进度、日志、产出文件；他人任务统一返回 404 |
-| `GET` | `/api/tasks/{task_id}/files/{filename}` | 下载该任务产出的文件（带归属校验，防越权与路径穿越） |
-| `GET` | `/healthz` | 探活与运行状态（免登录，给反向代理/监控用） |
+```text
+downloads/
+└── 用户ID/
+    └── 任务ID/
+        └── 视频.mp4
+```
 
----
+升级时，无归属的旧任务自动分配给第一个管理员，旧文件保留在下载目录顶层。没有管理员时，旧任务保持隐藏；创建管理员并重启后完成分配。
 
-## 实现原理
-
-### 抖音
-1. 解析分享链接/口令，提取 `aweme_id`。
-2. Playwright 无头启动浏览器打开作品页，收到页面响应后独立等待视频数据；遇到登录或验证码时可能失败。
-3. 拦截详情接口 `/aweme/v1/web/aweme/detail/` 的响应，从 `aweme_detail.video.play_addr.url_list` 取无水印直链。
-4. 用 `requests` 带 `Referer` 流式下载到本地。
-
-### B 站
-1. 解析 BV/av 号（b23.tv 短链自动跳转）。
-2. `view` 接口获取标题、UP 主、分 P 列表（每 P 的 cid）。
-3. `playurl` 接口（wbi 签名）获取播放地址：
-   - 默认（≤720P）：`fnval=0` 返回 `durl` → mp4 单文件直链，直接下载。
-   - `--hd`（1080P）：`fnval=16` 返回 `dash`（音视频分离）→ ffmpeg 合并。
-
-### Web
-1. 从登录会话取得用户 ID，`POST /api/tasks` 校验入参，在同一把锁内检查用户与全局名额，预占后写入 SQLite，再提交线程池。
-2. 后台线程按平台分流下载，通过回调把进度与日志回写任务仓库（进度写入带节流）。
-3. 成功、失败或提交异常时释放用户及全局名额；前端轮询自己的活跃任务，按内容指纹去重渲染。
-
----
-
-## 注意事项
-
-- 本工具仅供个人学习、研究及备份自己拥有权限的内容使用，请遵守目标平台的服务条款与当地法律法规，勿用于任何商业或侵权用途。
-- 首次创建管理员后，为使用者创建独立账号；不要共享管理员账号。
-- 抖音下载依赖浏览器：本机需要系统 Edge；容器/服务器上用 `chromium`（镜像内已装）。
-- B 站 1080P 高清下载需登录 Cookie（`SESSDATA` 等）且本机已安装 ffmpeg。
-- Web 新任务保存到 `downloads/用户ID/任务ID/`；CLI 使用 `-o` 指定目录，未指定时为当前目录。Web 用户限制不应用于独立 CLI 下载。
-
-
-## 服务器视频定期清理
-
-Web 服务默认保留下载文件 **24 小时**，**每小时检查一次**，第一次检查在启动一小时后进行。
-年龄按文件最后修改时间计算，所以重启后仍能清理之前留下的视频和失败下载的媒体临时文件。
-实际删除可能比保留时间晚一个检查周期；有后台下载或 `/api/tasks/{id}/files/{name}` 文件传输时，本轮跳过，下轮重试。
-清理覆盖旧文件所在的 `downloads/` 顶层，以及服务生成的 `用户ID/任务ID/` 两层 UUID 目录。
-只删除过期的 `.mp4`、`.m4s`、`.webm`、`.m4a`、`.part`、`.ytdl` 文件，
-不跟随符号链接，不进入任意其他目录，不删除目录或其他扩展名。
-任务记录和日志保留；已删除文件名从 API 返回中移除，已打开的页面需要刷新。
-
-| 环境变量 | 默认值 | 作用 |
+| 限制 | 默认值 | 含义 |
 |---|---|---|
-| `DOWNLOAD_RETENTION_HOURS` | `24` | 非负整数小时；`0` 关闭自动清理 |
-| `DOWNLOAD_CLEANUP_INTERVAL_SECONDS` | `3600` | 正整数秒，控制检查间隔 |
+| `MAX_CONCURRENCY` | `2` | 同时执行下载的任务数 |
+| `QUEUE_LIMIT` | `20` | 所有用户排队中 + 下载中的任务总数上限 |
+| `USER_QUEUE_LIMIT` | `3` | 单用户排队中 + 下载中的任务数上限 |
+| `MAX_LINKS_PER_TASK` | `20` | 一个任务可提交的链接数量 |
 
-Linux 启动示例（保留 48 小时）：
+达到用户或全局上限后，继续提交返回 429，页面显示原因。成功、失败、磁盘拒绝以及创建或提交异常都会释放名额。管理员同样受限；用户达到自己的上限时，其他用户仍可使用剩余全局名额。
 
-```bash
-DOWNLOAD_RETENTION_HOURS=48 DOWNLOAD_CLEANUP_INTERVAL_SECONDS=3600 \
-uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
-```
+这些限制按任务计数，不按链接计数。目前未实现每用户存储额度或公平调度。
 
-任务由 SQLite 持久化；下载队列和清理保护在进程内，服务器使用 **一个 worker、一个应用实例**。
-多个实例或 CLI 不应同时向这个受清理的目录写文件。清理由应用自行调度，无需额外安装 cron。
-Caddy 应将受控文件下载接口也反向代理给本应用，避免直接读取下载目录而绕过传输保护。
+## 命令行下载
 
-```mermaid
-flowchart LR
-    A[用户提交链接] --> B[后台下载：登记活动]
-    B --> C[downloads 视频文件]
-    C --> D[用户取文件：登记活动]
-    E[每小时检查] --> F{是否有活动?}
-    F -->|有| G[跳过本轮]
-    F -->|无| H[删除超过保留时间的媒体文件]
-    H --> I[移除任务里的失效链接]
-```
-
-
-## Caddy：8080 对外，代理 app 容器的 8000
-
-仓库的 `Caddyfile` 核心路由如下（另保留压缩、请求体限制及传输超时）：
-
-```caddyfile
-:8080 {
-    reverse_proxy app:8000
-}
-```
-
-- `:8080`：Caddy 在 8080 端口接收 HTTP 请求。
-- `reverse_proxy app:8000`：将所有路径（首页、API、静态资源、视频文件）转发给 `app` 容器的 8000 端口。
-- Caddy 容器与 `app` 容器必须连接同一个 Docker 网络，`app` 为服务名或网络别名。
-- app 容器内启动命令：`uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1`。
-- Caddy 容器端口映射：`8080:8080`；将此文件挂载到 `/etc/caddy/Caddyfile`。
-- app 的 8000 端口供容器网络访问，无需映射到公网。
-- 在 app 容器设置上述清理环境变量，并确保挂载的下载目录允许应用删除文件。
-
-若 Caddy 运行在宿主机上，则将 app 的端口映射为 `127.0.0.1:8000:8000`，
-并将代理目标改为 `127.0.0.1:8000`。
-
-更新服务器配置前可在 Caddy 容器运行：
+CLI 无需网站账号，独立运行，不经过 Web 的任务限制和任务仓库。默认保存到当前目录，使用 `-o` 指定其他位置：
 
 ```bash
-caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
-caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+python downloader.py -o ./cli-downloads "链接1" "链接2"
 ```
 
-本仓库的 `docker-compose.yml` 已映射 Caddy 的 `8080:8080`，app 容器内监听 8000。
-语法参考：https://caddyserver.com/docs/caddyfile/directives/reverse_proxy
+常用选项：
 
-```mermaid
-flowchart LR
-    U[浏览器：服务器地址:8080] --> C[Caddy :8080]
-    C --> A[app 容器 :8000]
-    A --> V[downloads 视频目录]
+| 参数 | 用途 |
+|---|---|
+| `-o, --output` | 保存目录，默认当前目录 |
+| `--engine chromium` | 抖音使用 Playwright Chromium |
+| `--cookies-from-browser edge` | 抖音失败时用 yt-dlp 从本机浏览器读取 Cookie 兜底 |
+| `--yt-dlp` | 抖音直接使用 yt-dlp |
+| `--p 2` / `--p ALL` | B 站指定分 P 或下载全部，默认全部 |
+| `--hd` | B 站下载高清 DASH 音视频并合并 |
+| `--cookie` | B 站登录 Cookie |
+
+```bash
+python downloader.py --engine chromium "抖音链接"
+python downloader.py --yt-dlp --cookies-from-browser edge "抖音链接"
+python downloader.py --p 2 "B站链接"
+python downloader.py --hd --cookie "SESSDATA=替换为有效值" "B站链接"
 ```
 
+B 站默认走最高 720P 的单文件下载；高清需要平台登录态和 PATH 中可用的 ffmpeg。上面的分 P、高清和浏览器 Cookie 选项属于 CLI，网页没有提供这些选项。
 
-## 抖音容器排查：Page.goto 超时
+Web 不会自动读取本机浏览器 Cookie，也没有启用基于 `cookies_browser` 的 yt-dlp 兜底。服务器平台登录态通过 `DOUYIN_COOKIE`、`BILI_COOKIE` 统一配置，暂不支持每用户独立平台 Cookie。
 
-出现 `Page.goto: Timeout ... waiting until "domcontentloaded"` 表示浏览器已启动，
-但导航没有在规定时间达到该加载阶段，不能仅凭此错误认定缺少浏览器或触发验证码。
-当前实现改用 `wait_until="commit"`（收到页面响应、开始加载文档），然后单独等作品详情。
-即使导航超时也尝试使用已经收到的数据；失败时记录页面状态、关键请求错误和标题。
-`blob:` 视频地址不交给 requests 下载，因为它只在浏览器内有效。
+## 配置
 
-| 环境变量 | 默认值 | 作用 |
+配置优先级为：**真实环境变量 > 项目根目录 `.env` > 代码默认值**。模板见 [.env.example](.env.example)。以下为代码默认值，复制模板后应按实际环境调整。
+
+| 变量 | 默认值 | 说明 |
 |---|---|---|
-| `DOUYIN_BROWSER_CHANNEL` | 未设置 | 兼容覆盖项；未设置时使用 `DOUYIN_ENGINE` |
-| `DOUYIN_NAVIGATION_TIMEOUT_MS` | `30000` | 正整数毫秒，等待页面初始响应 |
-| `DOUYIN_MEDIA_TIMEOUT_MS` | `30000` | 正整数毫秒，单独等待视频数据 |
+| `ADMIN_USERNAME` | `admin` | 首次创建的管理员用户名 |
+| `ADMIN_PASSWORD` | 空；回退旧 `ACCESS_TOKEN` | 初始管理员密码，仅没有账号时使用 |
+| `ACCESS_TOKEN` | 空 | 兼容旧部署，不再作为共享登录口令 |
+| `COOKIE_NAME` | `dy_token` | 会话 Cookie 名称 |
+| `COOKIE_MAX_AGE` | `2592000` | 会话有效期，单位秒，默认 30 天 |
+| `COOKIE_SECURE` | `false` | HTTPS 访问时设为 true；HTTP 使用 false |
+| `LOG_LEVEL` | `INFO` | DEBUG / INFO / WARNING / ERROR / CRITICAL |
+| `MAX_CONCURRENCY` / `QUEUE_LIMIT` / `USER_QUEUE_LIMIT` | `2` / `20` / `3` | 下载并发及全局、单用户未结束任务上限 |
+| `MAX_LINKS_PER_TASK` / `MAX_LINK_LEN` | `20` / `2048` | 每任务链接数及单条输入字符上限 |
+| `MIN_FREE_MB` | `2048` | 开始任务时的剩余磁盘空间下限，单位 MB |
+| `DOUYIN_ENGINE` | Windows: `msedge`；其他系统: `chromium` | 抖音浏览器引擎 |
+| `DOUYIN_BROWSER_CHANNEL` | 未设置 | 兼容覆盖项，优先于 `DOUYIN_ENGINE`；CLI `--engine` 优先级更高 |
+| `DOUYIN_COOKIE` / `BILI_COOKIE` | 空 | 服务端统一使用的平台登录态 |
+| `DOUYIN_NAVIGATION_TIMEOUT_MS` | `30000` | 抖音初始页面响应等待时间，单位毫秒 |
+| `DOUYIN_MEDIA_TIMEOUT_MS` | `30000` | 抖音作品数据等待时间，单位毫秒 |
+| `DOWNLOAD_DIR` | 项目内 `downloads/` | Web 下载根目录 |
+| `DATA_DIR` / `DB_PATH` | `data/` / `data/app.db` | 运行数据目录及 SQLite 数据库 |
+| `DOWNLOAD_RETENTION_HOURS` | `24` | 媒体保留小时数，0 关闭自动清理 |
+| `DOWNLOAD_CLEANUP_INTERVAL_SECONDS` | `3600` | 清理检查间隔，单位秒 |
 
-在 Linux 镜像构建期间，安装 Python 依赖后安装浏览器及系统依赖：
-
-```dockerfile
-RUN python -m playwright install --with-deps chromium
-```
-
-安装与运行需要使用一致的 Playwright 版本，并确保运行用户能够访问浏览器安装目录。
-安装方式参考：https://playwright.dev/python/docs/browsers
-
-服务器项目目录下检查 app 服务到抖音的网络：
+无效日志级别回退 INFO 并记录警告；无效或小于 1 的 `USER_QUEUE_LIMIT` 回退 3。修改容器环境配置后，需要重新创建 app 容器生效：
 
 ```bash
-docker compose exec app python -c "import requests; r=requests.get('https://www.douyin.com/', timeout=20); print(r.status_code)"
+docker compose up -d --build app
 ```
 
-这个检查仅验证 requests 到首页的连接，HTTP 200 也不能证明 Chromium 能拿到视频详情。
-若提示 DNS、连接超时或证书错误，先处理容器出口网络；若浏览器日志出现登录/验证页面，
-需要进一步确认平台访问要求。Caddy 的 8080→8000 是用户访问本应用的入口，
-抖音抓取则由 app 容器直接向外请求。
-Web 入口当前没有启用 `cookies_browser`，所以不会自动通过本机浏览器 Cookie 启用 yt-dlp 兜底。
+`HOST`、`PORT` 是配置项；手动启动 Uvicorn 时实际监听地址以启动参数为准。仓库 Docker 启动命令固定监听 `0.0.0.0:8000`。
 
-## 已知限制
+## 视频定期清理
 
-- **抖音在容器/服务器上可能被风控**：平台对无头浏览器的识别较严，接口可能返回空数据。
-  本机走系统 Edge 的成功率最高；服务器上建议只对外开放 B 站功能（详见 `DEPLOY.md`）。
-- **必须单 worker 运行**：任务队列与并发计数是进程私有的，`uvicorn --workers N` 会导致队列分叉；
-  要提升吞吐请调大 `MAX_CONCURRENCY`。
-- **独立账号与任务隔离**：管理员创建账号；不开放注册。管理员的任务接口也只显示自己任务。每用户未结束任务默认最多 3 个，存储额度和公平调度暂未实现。
+默认保留媒体 24 小时，每小时检查一次，第一次检查在启动一小时后进行。文件年龄按最后修改时间计算，实际删除可能晚于保留时间；服务忙碌时会继续延后。
 
+- 有后台下载或文件传输时，整轮清理跳过。
+- 同时检查下载目录顶层的旧文件和服务生成的两层 UUID 用户/任务目录。
+- 只删除过期的 `.mp4`、`.m4s`、`.webm`、`.m4a`、`.part`、`.ytdl` 文件，不跟随符号链接、不删除目录。
+- 保留任务与日志，从任务文件列表移除已删除文件；已打开的页面需要刷新。
+
+不要让独立 CLI 或其他应用同时向 Web 的受清理目录写入文件。清理由应用线程调度，不需要额外配置 cron。
 
 ## 运维日志
 
-Web 服务输出单行 JSON 日志，由 Docker 收集。`LOG_LEVEL` 默认 `INFO`。
-可按 `request_id` 追踪请求、`task_id` 追踪下载、`user_id` 追踪用户；网页任务日志继续存 SQLite，每个任务最多 500 条。
-Caddy 访问日志已开启；两种容器均按每个文件 10MB、最多 3 个轮转。
-口令、Cookie、Authorization 与 URL 查询值共用脱敏；Caddy 访问日志去掉查询串及请求/响应头。
-容量轮转不保证固定保留天数，删除或重建容器可能丢失旧日志。
-查看与排错步骤见 [DEPLOY.md 的运维日志部分](DEPLOY.md#九运维日志)。
+应用日志采用单行 JSON 输出到标准输出，由 Docker 收集；网页任务日志继续存 SQLite，每任务最多 500 条。
+
+| 字段 | 用途 |
+|---|---|
+| `request_id` | 关联一次请求；正常响应头包含 `X-Request-ID` |
+| `task_id` | 关联任务创建及后台下载过程 |
+| `user_id` | 关联当前用户及后台任务 |
+| `event` | 区分请求、任务、清理、外部工具和拒绝事件 |
+
+异常记录脱敏后的堆栈；配置口令、Cookie、Authorization、URL 用户信息和查询值共用脱敏。Caddy 访问日志去掉 URI 查询串及请求、响应头字段。未处理异常继续交给框架，异常 500 响应不保证带 `X-Request-ID`。
+
+在服务器项目目录查看：
 
 ```bash
+# 最近 30 分钟应用日志，显示最多 200 条并实时跟踪
 docker compose logs --no-log-prefix --since 30m --tail 200 -f app
+
+# Caddy 访问日志
 docker compose logs --no-log-prefix --since 30m --tail 200 caddy
-# 替换为实际任务 ID
+
+# 替换为真实任务 ID；也可替换为请求 ID 或用户 ID
 docker compose logs --no-log-prefix --since 24h app | grep -F '任务ID'
 ```
 
+`--no-log-prefix` 保持每行可独立解析的 JSON；`-f` 持续跟踪，Ctrl+C 只退出查看，不停止服务。
 
-## 本地文件与版本控制
+正常探活和静态资源访问仅在应用 DEBUG 级别记录；Caddy 仍记录访问日志。用户达到任务上限时记录 `user_queue_rejected`。yt-dlp 服务输出接入任务日志并减少重复进度，ffmpeg 失败保留脱敏 stderr 末尾最多 8KB。
 
-`.gitignore` 排除运行数据、下载媒体、数据库及其 WAL/SHM、环境配置、虚拟环境、
-本地测试、备份目录和开发工具产物；`.env.example` 继续纳入版本控制。
-测试保留在本地 `tests/`，也由 `.dockerignore` 排除，不随仓库或镜像交付。
-自定义路径中的数据库和媒体文件同样按扩展名忽略；有意提交的示例文件需单独调整规则。
+app 和 Caddy 均采用 Docker `json-file`，单文件 `10m`，最多 `3` 个。容量轮转不保证固定保留天数，删除或重建容器可能丢失历史日志；SQLite 数据由 `data/` 挂载保存。
 
-忽略规则只作用于未跟踪文件，已经提交过的文件不会自动退出版本控制。
+## HTTP 接口
+
+业务接口需要会话 Cookie。登录页、登录接口、探活及静态资源公开。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/` | 下载台，未登录跳转登录页 |
+| GET | `/login` | 用户名与密码登录页 |
+| POST | `/api/login` | 请求体 `{"username":"alice","password":"..."}` |
+| POST | `/api/logout` | 撤销当前会话并清除 Cookie |
+| GET | `/api/me` | 当前用户信息，不含密码或会话凭证 |
+| POST | `/api/tasks` | 请求体 `{"links":["链接1","链接2"]}`；身份由服务端填写 |
+| GET | `/api/tasks` | 当前用户的任务列表 |
+| GET | `/api/tasks/{task_id}` | 当前用户任务的进度、日志和文件 |
+| GET | `/api/tasks/{task_id}/files/{filename}` | 归属检查后的文件下载 |
+| GET | `/healthz` | 磁盘、全局未结束任务数及并发配置 |
+
+常见响应：401 表示未登录或会话失效，404 表示任务不存在或不属于当前用户，429 表示用户或全局任务名额已满。
+
+## 代码与数据流
+
+```text
+app/
+├── config.py          环境配置与默认值
+├── users.py           用户、密码散列、服务端会话和账号管理命令
+├── auth.py            会话鉴权及请求用户绑定
+├── main.py            路由、线程池、用户与全局任务名额
+├── task_store.py      SQLite 任务、日志及文件列表
+├── cleanup.py         定期清理与文件使用保护
+└── logging_setup.py   JSON 日志、脱敏和请求上下文
+bilibili.py            B 站下载
+downloader.py        抖音下载与 CLI 入口
+static/               页面脚本及样式
+templates/            登录页与下载台
+```
+
+```mermaid
+flowchart TD
+    登录[用户名和密码] --> 校验[authenticate 校验密码]
+    校验 --> 会话[create_session 生成会话]
+    会话 --> Cookie
+    Cookie --> 身份[resolve_session 取得当前用户]
+    身份 --> 限制[create_task 检查并预占名额]
+    限制 --> SQLite
+    限制 --> 线程池
+    线程池 --> 下载[后台下载至用户任务目录]
+    下载 --> SQLite
+    下载 --> 日志[JSON 运维日志]
+    SQLite --> 页面[当前用户查询进度与日志]
+```
+
+几个值得读的函数：
+
+- `hash_password()` 使用随机盐值和 PBKDF2-SHA256，数据库不保存明文密码。
+- `resolve_session()` 从数据库查询未过期的会话；`AuthMiddleware.__call__()` 将身份放入 `request.state.user`。
+- `create_task()` 在一把锁内检查用户与全局计数，防止同时提交突破限制；`_release_slot()` 回收两种名额。
+- `TaskStore.get(..., user_id=...)` 和 `all(user_id=...)` 在 SQL 查询阶段限定归属。
+- `task_directory()` 构建文件目录；`cleanup_once()` 清理过期媒体并移除失效链接。
+- `log_context()` 绑定日志关联信息，退出时恢复；提交线程池时使用 `copy_context()` 传递上下文。
+
+`?` 是 SQLite 参数占位符，值单独传入；`with self.lock, self.conn:` 管理线程互斥和数据库事务。
+网站用户不是操作系统用户：不同账号仍共享同一个服务进程，归属检查控制数据访问，目录分开解决文件覆盖，锁解决并发计数。
+
+## 限制与排障
+
+- **保持单 worker、单应用实例。** 队列计数、线程池和清理保护在进程内；增加 worker 会使限制失去全局一致性。
+- **抖音可能受平台风控。** 当前导航先等待 `commit`，再独立等待作品数据。首页返回 HTTP 200 不代表能获取视频详情，应结合日志中的阶段、网络错误和页面状态排查。
+- **资源仍然共享。** 每用户任务上限可以防止单账号占满默认队列，但尚无公平调度、存储额度或个人平台 Cookie。
+- **账号由服务器命令管理。** 暂无自助注册和网页账号管理。
+- **旧日志不会批量脱敏改写。** 新增脱敏只覆盖之后写入的消息，升级前的敏感历史记录需要另行处理。
+
+具体故障处理、数据库迁移与备份步骤见 [部署说明](DEPLOY.md)。仅下载自己有权保存的内容，并遵守目标平台条款。
+
+## 版本控制
+
+`.gitignore` 排除环境配置、运行数据库、媒体、备份、虚拟环境、本地测试与开发产物，`.env.example` 保留在仓库。
+本地 `tests/` 不纳入 Git，也由 `.dockerignore` 排除。已跟踪文件不会因为新增忽略规则自动退出版本控制。
