@@ -62,7 +62,7 @@ services:
       app:
         condition: service_healthy     # 等 app 探活通过再启动，避免启动即 502
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data               # 证书持久化：重启不会重复申请（否则会触发限流）
