@@ -35,12 +35,36 @@ venv.bak/
 
 # ---- 项目下载目录（视频文件不入库）----
 downloads/
+# CLI 允许下载到当前目录或自定义目录
+*.mp4
+*.webm
+*.m4a
+*.m4s
+*.part
+*.ytdl
 
 # ---- 运行期数据（SQLite 库） ----
 data/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite-journal
+*.sqlite3-journal
+
+# ---- 部署备份（包含账号、会话及下载文件）----
+/data-backup-*/
+/downloads-backup-*/
 
 # ---- 日志 ----
 *.log
+*.log.*
 
 # ---- 环境变量 ----
 .env
@@ -62,8 +86,7 @@ $RECYCLE.BIN/
 
 # ---- 工具 / IDE 插件生成 ----
 .workbuddy/
-
-
+.learnings/
 
 # ---- Playwright / 浏览器自动化产物 ----
 test-results/
